@@ -5142,7 +5142,7 @@ function openAssetFormModal(existingAsset) {
       const mode = livePriceSelect.value;
       apiSymbolWrap.style.display = (mode === 'yahoo' || mode === 'mfapi') ? '' : 'none';
       livePriceHint.style.display = mode === 'manual' ? 'none' : '';
-      if (mode === 'yahoo') { apiSymbolLabel.textContent = 'Ticker Symbol'; apiSymbolInput.placeholder = 'e.g. RELIANCE.NS, TCS.NS'; livePriceHint.textContent = 'Use the ".NS" suffix for NSE, ".BO" for BSE. On refresh this tries Yahoo Finance first, then automatically falls back to a community NSE/BSE API using the same symbol if Yahoo is blocked — no separate setup needed. Either can fail on a given day; if both do, the price is left as last entered.'; }
+      if (mode === 'yahoo') { apiSymbolLabel.textContent = 'Ticker Symbol'; apiSymbolInput.placeholder = 'e.g. RELIANCE.NS, TCS.NS'; livePriceHint.textContent = 'Use the ".NS" suffix for NSE, ".BO" for BSE. On refresh this calls your Netlify Function (/api/stock-quote) first — reliable, same-origin — with one plain direct-to-Yahoo request as backup if that\'s briefly unreachable. If both fail, the price is left as last entered and the reason is shown in the results.'; }
       else if (mode === 'mfapi') { apiSymbolLabel.textContent = 'MF Scheme Code'; apiSymbolInput.placeholder = 'e.g. 120503'; livePriceHint.textContent = 'Find the scheme code by searching your fund\'s name at mfapi.in — it\'s the numeric code in the URL of its page.'; }
       else if (mode === 'gold' || mode === 'silver') { livePriceHint.textContent = 'Spot price per gram, fetched via goldapi.io — add your free API key in Settings → Live Prices.'; }
     };
@@ -6064,9 +6064,7 @@ function openBulkImportModal() {
 
 /* ===================== LIVE PRICES ENGINE =====================
    Manual-effort reduction: fetches current prices instead of requiring the
-   user to type them in. Every source here is a plain client-side fetch —
-   this is a static Netlify site with no backend, so that's the only option
-   available without changing the architecture.
+   user to type them in.
 
    Every fetch function below returns { price, error } rather than just a
    price-or-null — a bare null gave no way to tell "no symbol set" apart
@@ -6080,27 +6078,17 @@ function openBulkImportModal() {
      CORS-open — these should just work from the browser every time.
    - goldapi.io (Gold/Silver) is free but needs a key (Settings > Live
      Prices) and does support browser CORS with the x-access-token header.
-   - Stocks ("Yahoo Finance" source) try FIVE things in order before giving
-     up: Yahoo direct, Yahoo via two different HTTPS CORS proxies, then a
-     second independent source — a community-run NSE/BSE API (also Yahoo-
-     sourced, but via someone else's server) — via those same two proxies.
-     That community API (github.com/0xramm/Indian-Stock-Market-API) is
-     plain HTTP, not HTTPS, so it's NEVER attempted direct: an HTTPS page
-     calling an HTTP URL gets hard-blocked as mixed content by the browser
-     itself, before CORS is even checked — routing it through an HTTPS
-     proxy sidesteps that the same way the proxies already sidestep CORS
-     for Yahoo. It's also a single volunteer-run server with no uptime
-     guarantee, so treat it as a bonus fallback, not a dependency. If all
-     five attempts fail, the price is left untouched and reported with the
-     real reason — never silently zeroed out. The results modal shows
-     exactly which attempt (if any) succeeded.
+   - Stocks ("Yahoo Finance" source) go through YOUR Netlify Function first
+     (netlify/functions/stock-quote.js, called same-origin at /api/stock-
+     quote — no CORS or mixed-content possible, this is the reliable path),
+     with one plain direct-to-Yahoo request as a free backup if the function
+     is briefly unreachable. Earlier versions of this chased CORS failures
+     through public proxies and a third-party community API — that's gone;
+     the function replaces all of it. If both attempts fail, the price is
+     left untouched and reported with the real reason, never silently
+     zeroed out.
    ========================================================================= */
 const YAHOO_DIRECT_URL = (symbol) => `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`;
-const INDIAN_STOCK_API_URL = (symbol) => `http://65.0.104.9/stock?symbol=${encodeURIComponent(symbol)}&res=num`;
-const CORS_PROXIES = [
-  (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
-  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
-];
 
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 14000) {
   const ctrl = new AbortController();
@@ -6120,23 +6108,18 @@ function parseYahooChartPrice(json) {
   const price = json?.chart?.result?.[0]?.meta?.regularMarketPrice;
   return typeof price === 'number' ? price : null;
 }
-function parseIndianStockApiPrice(json) {
-  if (json?.status !== 'success') return null;
-  const price = json?.data?.last_price;
-  return typeof price === 'number' ? price : null;
-}
 
 async function fetchYahooQuote(symbol) {
   if (!symbol) return { price: null, error: 'No ticker symbol set on this asset' };
+  // Down to 2 attempts, on purpose: your Netlify Function (/api/stock-quote) is the real
+  // fix and works reliably now that it's deployed — same-origin, no CORS/mixed-content
+  // possible. The old 6-attempt chain (2 public CORS proxies + a 3rd-party community API,
+  // each tried twice) was noise once that function existed; it's gone. What's left is one
+  // plain direct-to-Yahoo attempt as a free, simple backup in case the function has an off
+  // day — nothing routed through a public proxy anymore.
   const attempts = [
-    // Same-origin — no CORS/mixed-content possible. 404s cleanly (falls through below)
-    // until you deploy netlify/functions/stock-quote.js; once deployed, this wins every time.
     { label: 'your Netlify Function (/api/stock-quote)', url: `/api/stock-quote?symbol=${encodeURIComponent(symbol)}`, timeout: 8000, parse: (json) => (typeof json?.price === 'number' ? json.price : null) },
-    { label: 'Yahoo direct', url: YAHOO_DIRECT_URL(symbol), timeout: 10000, parse: parseYahooChartPrice },
-    { label: 'Yahoo via proxy 1 (corsproxy.io)', url: CORS_PROXIES[0](YAHOO_DIRECT_URL(symbol)), timeout: 14000, parse: parseYahooChartPrice },
-    { label: 'Yahoo via proxy 2 (allorigins.win)', url: CORS_PROXIES[1](YAHOO_DIRECT_URL(symbol)), timeout: 14000, parse: parseYahooChartPrice },
-    { label: 'community NSE/BSE API via proxy 1', url: CORS_PROXIES[0](INDIAN_STOCK_API_URL(symbol)), timeout: 14000, parse: parseIndianStockApiPrice },
-    { label: 'community NSE/BSE API via proxy 2', url: CORS_PROXIES[1](INDIAN_STOCK_API_URL(symbol)), timeout: 14000, parse: parseIndianStockApiPrice }
+    { label: 'Yahoo direct (backup)', url: YAHOO_DIRECT_URL(symbol), timeout: 10000, parse: parseYahooChartPrice }
   ];
   let lastError = 'Unknown error';
   for (const attempt of attempts) {
@@ -6255,7 +6238,7 @@ function showLivePriceResultsModal(results, targetsLength) {
         </tbody>
       </table>
     </div>
-    ${failed.some(f => f.mode === 'yahoo') ? `<div class="field helptext">Stock quotes try your own Netlify Function first (/api/stock-quote — see the deploy guide), then fall back to Yahoo direct, Yahoo via 2 public proxies, then a community NSE/BSE API via those same 2 proxies. If everything failed here, deploy the function for a reliable fix — the public-proxy fallbacks are a safety net, not something to depend on. mfapi.in (Mutual Funds) and open.er-api.com (FX) don't have this problem.</div>` : ''}
+    ${failed.some(f => f.mode === 'yahoo') ? `<div class="field helptext">Stock quotes call your Netlify Function first (/api/stock-quote), with one plain direct-to-Yahoo request as backup. If both failed here, check the function is deployed and reachable at that URL directly. mfapi.in (Mutual Funds) and open.er-api.com (FX) don't have this problem.</div>` : ''}
     <div class="modal-actions">
       <button class="btn btn-primary" id="f-lp-close">Close</button>
     </div>
