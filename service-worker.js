@@ -11,7 +11,7 @@
    - User data lives in localStorage/IndexedDB, untouched by cache changes.
    ========================================================================= */
 
-const CACHE_VERSION = 'v12';
+const CACHE_VERSION = 'v13';
 const CACHE_NAME = `wealth-ledger-${CACHE_VERSION}`;
 
 const APP_SHELL = [
