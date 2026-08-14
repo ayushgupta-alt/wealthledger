@@ -1,95 +1,73 @@
-/* ===================== WEALTH LEDGER — SERVICE WORKER =====================
-   Update workflow (see plan section 7):
-   - Bump CACHE_VERSION on every deploy. That's the ONLY thing that needs to
-     change to ship an update — it invalidates the old cache and triggers the
-     in-app "Update available" prompt on next launch/foreground.
-   - The new SW installs and sits in "waiting" state; it does NOT activate
-     automatically (no self.skipWaiting() on install). The page detects the
-     waiting worker and shows a toast. Only when the user taps "Reload" does
-     the page tell this SW to skip waiting and take over — so an update never
-     interrupts an active session (e.g. mid transaction-entry).
-   - User data lives in localStorage/IndexedDB, untouched by cache changes.
-   ========================================================================= */
+// netlify/functions/stock-quote.js
+//
+// Runs server-side on Netlify's infrastructure, not in the visitor's browser.
+// That's the entire point: Yahoo Finance blocks/behaves inconsistently for
+// direct browser calls (CORS + bot detection), but has no problem with a
+// plain server-to-server request carrying a normal browser User-Agent.
+//
+// Because this deploys under the SAME domain as the rest of Wealth Ledger,
+// the app calling it is a same-origin request — no CORS negotiation needed
+// at all, no public proxy in the middle, no mixed-content issue. This is
+// the reliable fix; everything before this was working around not having it.
+//
+// Called as: /api/stock-quote?symbol=RELIANCE.NS
 
-const CACHE_VERSION = 'v14';
-const CACHE_NAME = `wealth-ledger-${CACHE_VERSION}`;
-
-const APP_SHELL = [
-  './',
-  './index.html',
-  './manifest.json',
-  './icons/icon-192.png',
-  './icons/icon-512.png',
-  './icons/icon-512-maskable.png'
-];
-
-self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL))
-  );
-  // Deliberately no self.skipWaiting() here — see update workflow note above.
-});
-
-self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(
-        keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))
-      )
-    ).then(() => self.clients.claim())
-  );
-});
-
-// Page sends this once the user taps "Reload" on the update toast.
-self.addEventListener('message', (event) => {
-  if (event.data === 'SKIP_WAITING') self.skipWaiting();
-});
-
-self.addEventListener('fetch', (event) => {
-  const req = event.request;
-  if (req.method !== 'GET') return;
-
+export default async (req) => {
   const url = new URL(req.url);
+  const symbol = url.searchParams.get('symbol');
 
-  // Dynamic API requests (e.g. live stock prices): NEVER served from the
-  // static app-shell cache and NEVER cached by this service worker at all.
-  // These must always go over the network so a price fetched today can't
-  // get stuck being served from yesterday's cache-first response. Network
-  // failures surface as a real failed fetch (caught by the app's own
-  // fetch-error handling) instead of silently returning a stale cached
-  // price — a stale number here is worse than a visible failure.
-  if (url.origin === self.location.origin && url.pathname.startsWith('/api/')) {
-    event.respondWith(fetch(req));
-    return;
+  if (!symbol) {
+    return new Response(JSON.stringify({ error: 'Missing "symbol" query parameter' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 
-  // App shell (same-origin): cache-first, so the app opens instantly and
-  // works fully offline on the last installed version.
-  if (url.origin === self.location.origin) {
-    event.respondWith(
-      caches.match(req).then((cached) => {
-        if (cached) return cached;
-        return fetch(req).then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
-          return res;
-        }).catch(() => caches.match('./index.html'));
-      })
+  try {
+    const yahooRes = await fetch(
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`,
+      {
+        headers: {
+          // Yahoo's edge tends to reject requests with no browser-like User-Agent —
+          // this alone fixes a good chunk of the failures a bare server fetch would hit.
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+        }
+      }
     );
-    return;
-  }
 
-  // Cross-origin (Google Fonts etc.): stale-while-revalidate — serve cached
-  // copy immediately if present, refresh in the background for next time.
-  event.respondWith(
-    caches.open(CACHE_NAME).then((cache) =>
-      cache.match(req).then((cached) => {
-        const fetchPromise = fetch(req).then((res) => {
-          if (res && res.status === 200) cache.put(req, res.clone());
-          return res;
-        }).catch(() => cached);
-        return cached || fetchPromise;
-      })
-    )
-  );
-});
+    if (!yahooRes.ok) {
+      return new Response(JSON.stringify({ error: `Yahoo returned HTTP ${yahooRes.status}` }), {
+        status: 502,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    const data = await yahooRes.json();
+    const price = data?.chart?.result?.[0]?.meta?.regularMarketPrice;
+    const asOf = data?.chart?.result?.[0]?.meta?.regularMarketTime;
+
+    if (typeof price !== 'number') {
+      return new Response(JSON.stringify({ error: `No price found for "${symbol}" — check the ticker (e.g. RELIANCE.NS, TCS.NS)` }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    return new Response(JSON.stringify({ symbol, price, asOf: asOf || null }), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        // Short cache so refreshing several assets back-to-back doesn't hammer Yahoo
+        // for a symbol you just fetched seconds ago, without ever serving stale data.
+        'Cache-Control': 'public, max-age=30'
+      }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: e && e.message ? e.message : 'Fetch to Yahoo failed' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+};
+
+export const config = { path: '/api/stock-quote' };
