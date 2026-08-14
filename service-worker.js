@@ -11,7 +11,7 @@
    - User data lives in localStorage/IndexedDB, untouched by cache changes.
    ========================================================================= */
 
-const CACHE_VERSION = 'v13';
+const CACHE_VERSION = 'v14';
 const CACHE_NAME = `wealth-ledger-${CACHE_VERSION}`;
 
 const APP_SHELL = [
@@ -50,6 +50,18 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
 
   const url = new URL(req.url);
+
+  // Dynamic API requests (e.g. live stock prices): NEVER served from the
+  // static app-shell cache and NEVER cached by this service worker at all.
+  // These must always go over the network so a price fetched today can't
+  // get stuck being served from yesterday's cache-first response. Network
+  // failures surface as a real failed fetch (caught by the app's own
+  // fetch-error handling) instead of silently returning a stale cached
+  // price — a stale number here is worse than a visible failure.
+  if (url.origin === self.location.origin && url.pathname.startsWith('/api/')) {
+    event.respondWith(fetch(req));
+    return;
+  }
 
   // App shell (same-origin): cache-first, so the app opens instantly and
   // works fully offline on the last installed version.
