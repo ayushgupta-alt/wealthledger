@@ -1159,7 +1159,7 @@ function defaultSettings() {
        Keyless, CORS-friendly sources only run automatically; the one source that needs a
        key (metals) or is CORS-unreliable from a static site (stocks) stays opt-in/manual-
        trigger. autoRefreshOnOpen is throttled to once/day, same pattern as autoBackup. */
-    livePrices: { autoRefreshOnOpen: false, lastRefresh: null, goldApiKey: '' }
+    livePrices: { autoRefreshOnOpen: false, lastRefresh: null, lastAttempt: null, goldApiKey: '' }
   };
 }
 /* ---------- Bill-style liabilities (Tax Payable / Utility & Bills / Subscriptions) ----------
@@ -1212,7 +1212,23 @@ function defaultState() {
    missing, rather than losing them to a shallow Object.assign overwrite. */
 function mergeLoadedState(loaded) {
   const merged = Object.assign(defaultState(), loaded);
-  merged.settings = Object.assign(defaultSettings(), loaded.settings || {});
+  // One-level-deep merge into `settings` (Phase 12 hardening): a plain Object.assign only
+  // merges TOP-LEVEL settings keys — a nested sub-object present in the loaded data (e.g.
+  // livePrices, autoSnapshot, assetsViewPrefs) would wholesale REPLACE the default one,
+  // silently dropping any new sub-keys added to defaults since that backup was taken
+  // (e.g. livePrices.lastAttempt) instead of backfilling them. This matches the merge
+  // behavior this function already documents/intends, just applied correctly.
+  const defaults = defaultSettings();
+  const loadedSettings = loaded.settings || {};
+  const mergedSettings = Object.assign({}, defaults, loadedSettings);
+  Object.keys(defaults).forEach(key => {
+    const defVal = defaults[key], loadedVal = loadedSettings[key];
+    if (defVal && typeof defVal === 'object' && !Array.isArray(defVal) &&
+        loadedVal && typeof loadedVal === 'object' && !Array.isArray(loadedVal)) {
+      mergedSettings[key] = Object.assign({}, defVal, loadedVal);
+    }
+  });
+  merged.settings = mergedSettings;
   merged.auditLog = loaded.auditLog || [];
   merged.transactionLog = loaded.transactionLog || [];
   merged.loanCategories = loaded.loanCategories || defaultState().loanCategories;
@@ -1333,6 +1349,23 @@ function topNWithOverflow(items, n, noun) {
   return { shown, overflowCount, overflowText };
 }
 function escapeAttr(s) { return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;'); }
+/* ---------- HTML text-content escaping (Phase 4 hardening) ----------
+   escapeAttr() above only covers `&`/`"` for attribute-value contexts (existing usage
+   left untouched -- see call sites). This covers the broader case: any user-controlled or
+   imported string (asset/liability/loan/bill names, transaction notes, custodians,
+   issuers, purposes, classifications, imported CSV values, etc.) inserted as HTML TEXT
+   CONTENT via innerHTML template strings needs `<`/`>` escaped too, or a value like
+   `<img src=x onerror=...>` typed into a name field executes as markup instead of
+   rendering as text. Safe to wrap already-safe values too -- it's a no-op on plain text. */
+function escapeHTML(s) {
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 /* A return figure (XIRR/CAGR/gain%) below this is "weak" rather than genuinely healthy —
    roughly the line between beating a safe alternative (FD/debt fund) and not. */
@@ -1392,7 +1425,10 @@ function animateNumber(el, targetValue, formatter) {
 let toastTimer = null;
 function showToast(msg) {
   const el = document.getElementById('toast');
-  el.innerHTML = '<span class="toast-dot"></span><span>' + msg + '</span>';
+  // msg is frequently built from asset/liability names (e.g. "Moved ₹500: <name> → <name>")
+  // via template strings — escape as text content so a malicious name can't inject markup
+  // through the toast (this uses innerHTML for the dot+text layout).
+  el.innerHTML = '<span class="toast-dot"></span><span>' + escapeHTML(msg) + '</span>';
   el.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
@@ -1471,6 +1507,12 @@ function xnpv(rate, cashflows) {
 }
 function xirr(cashflows) {
   if (!cashflows || cashflows.length < 2) return null;
+  // A non-finite cashflow amount (e.g. an unconvertible foreign-currency
+  // leg — see toBaseCurrency()) must never be folded into the solve: with a
+  // NaN in the set, both hasPos/hasNeg checks and the bisection fallback's
+  // sign comparisons (NaN < 0 is always false) can spuriously pass, letting
+  // the bisection converge on a bogus finite rate instead of failing safely.
+  if (cashflows.some(c => !Number.isFinite(c.amount))) return null;
   const sorted = [...cashflows].sort((a, b) => new Date(a.date) - new Date(b.date));
   const hasPos = sorted.some(c => c.amount > 0);
   const hasNeg = sorted.some(c => c.amount < 0);
@@ -1511,6 +1553,11 @@ function xirr(cashflows) {
    keep behaving exactly as they did. */
 function emiAmount(principal, annualRatePct, tenureMonths, interestType) {
   interestType = interestType || 'reducing';
+  // Defensive guard against non-finite/negative principal or rate reaching the amortization
+  // math below — CSV import (parseMasterCSV) doesn't go through the Add Loan form's own
+  // validation, so a bad value could otherwise still reach here and produce a negative or
+  // NaN EMI (Phase 10 hardening — return 0, same as the existing invalid-tenure case).
+  if (!Number.isFinite(principal) || principal < 0 || !Number.isFinite(annualRatePct) || annualRatePct < 0) return 0;
   if (!tenureMonths || tenureMonths <= 0) return 0;
   if (interestType === 'flat') {
     const r = (annualRatePct || 0) / 100;
@@ -1571,7 +1618,10 @@ function amortizationSchedule(principal, annualRatePct, tenureMonths, startDate,
    flat interest), so those skip Newton-Raphson entirely. */
 function loanTenureFromEMI(principal, annualRatePct, emi, interestType) {
   interestType = interestType || 'reducing';
-  if (!principal || !emi || emi <= 0) return null;
+  // Reject non-finite/negative inputs explicitly -- a bare `!principal` truthiness check
+  // lets negative numbers through (they're truthy in JS), which fed a negative principal
+  // into -Math.log(...) below and silently returned a negative tenure (Phase 6 hardening).
+  if (!Number.isFinite(principal) || principal <= 0 || !Number.isFinite(emi) || emi <= 0) return null;
   if (interestType === 'flat') {
     const r = (annualRatePct || 0) / 100;
     const denom = emi - (principal * r) / 12;
@@ -1586,7 +1636,7 @@ function loanTenureFromEMI(principal, annualRatePct, emi, interestType) {
 }
 function loanPrincipalFromEMI(annualRatePct, tenureMonths, emi, interestType) {
   interestType = interestType || 'reducing';
-  if (!tenureMonths || !emi || emi <= 0) return null;
+  if (!Number.isFinite(tenureMonths) || tenureMonths <= 0 || !Number.isFinite(emi) || emi <= 0) return null;
   if (interestType === 'flat') {
     const r = (annualRatePct || 0) / 100;
     return (emi * tenureMonths) / (1 + r * (tenureMonths / 12));
@@ -1597,7 +1647,7 @@ function loanPrincipalFromEMI(annualRatePct, tenureMonths, emi, interestType) {
 }
 function loanRateFromEMI(principal, tenureMonths, emi, interestType) {
   interestType = interestType || 'reducing';
-  if (!principal || !tenureMonths || !emi || emi <= 0 || emi * tenureMonths <= principal) return null;
+  if (!Number.isFinite(principal) || principal <= 0 || !Number.isFinite(tenureMonths) || tenureMonths <= 0 || !Number.isFinite(emi) || emi <= 0 || emi * tenureMonths <= principal) return null;
   if (interestType === 'flat') {
     const rate = ((emi * tenureMonths) / principal - 1) * (12 / tenureMonths) * 100;
     return (isFinite(rate) && rate >= 0) ? rate : null;
@@ -1699,7 +1749,10 @@ function categoryCashflows(assetsInCat) {
 function categoryXIRR(assetsInCat) {
   const withTx = assetsInCat.filter(a => a.transactions.length);
   if (!withTx.length) return null;
-  return xirr(categoryCashflows(withTx));
+  // Exclude unconvertible (missing FX rate) legs rather than let one asset
+  // null out the whole category's XIRR — see overallPortfolioXIRR().
+  const cfs = categoryCashflows(withTx).filter(cf => Number.isFinite(cf.amount));
+  return xirr(cfs);
 }
 function categoryHoldingYears(assetsInCat) {
   const withTx = assetsInCat.filter(a => a.transactions.length);
@@ -1793,7 +1846,8 @@ function purposeAllocation() {
   const byPurpose = {};
   state.assets.forEach(a => {
     const p = a.purpose || 'Unassigned';
-    byPurpose[p] = (byPurpose[p] || 0) + assetCurrentValue(a);
+    const v = assetCurrentValue(a);
+    if (Number.isFinite(v)) byPurpose[p] = (byPurpose[p] || 0) + v;
   });
   return Object.entries(byPurpose).map(([purpose, value]) => ({ purpose, value, actualPct: total > 0 ? (value / total) * 100 : 0 }));
 }
@@ -1977,7 +2031,11 @@ function dsrBand(pct) {
 }
 
 /* ---------- Totals & allocations ---------- */
-function totalAssets() { return state.assets.reduce((s, a) => s + assetCurrentValue(a), 0); }
+// Uses baseCurrencySum() so one asset with an unconvertible foreign currency
+// (missing FX rate — see toBaseCurrency()) can't blank the entire Net Worth
+// display; that asset is excluded from the total and flagged separately via
+// Health Check, while its own row still renders "—" for its value.
+function totalAssets() { return baseCurrencySum(state.assets, a => assetCurrentValue(a)); }
 function totalLiabilities() {
   const cc = state.creditCards.reduce((s, c) => s + creditCardOutstanding(c), 0);
   const ln = state.loans.reduce((s, l) => s + loanActualBalance(l), 0);
@@ -2018,7 +2076,24 @@ function toBaseCurrency(amount, currency) {
   const base = state.settings.baseCurrency;
   if (!currency || currency === base) return amount;
   const rate = state.settings.exchangeRates[currency];
-  return rate ? amount * rate : amount;
+  // A missing/invalid rate must NEVER fall back to treating the amount as
+  // already-in-base (a silent 1:1 conversion). Returning NaN here makes the
+  // failure explicit and detectable at every call site; fmtINR/fmtNum/fmtPct
+  // already render NaN as "—" instead of a wrong number, and summation call
+  // sites explicitly exclude non-finite contributions (see baseCurrencySum())
+  // so one missing rate can't silently corrupt a dashboard/report total.
+  if (!Number.isFinite(rate) || rate <= 0) return NaN;
+  return amount * rate;
+}
+// Sums an array through a value-getter that may return NaN (unconvertible
+// due to a missing FX rate, per toBaseCurrency() above). Non-finite values
+// are excluded from the total rather than silently included as 1:1 or
+// allowed to poison the whole sum into NaN — see Phase 2 (FX safety).
+function baseCurrencySum(items, getter) {
+  return items.reduce((s, item) => {
+    const v = getter(item);
+    return s + (Number.isFinite(v) ? v : 0);
+  }, 0);
 }
 
 /* ---------- Persistent category colors ----------
@@ -2039,6 +2114,9 @@ function assetAllocation() {
   const byCategory = {};
   state.assets.forEach(a => {
     const v = assetCurrentValue(a);
+    // Skip non-finite (unconvertible FX) values so one bad asset doesn't
+    // poison — and thereby silently hide — its whole category's segment.
+    if (!Number.isFinite(v)) return;
     byCategory[a.category] = (byCategory[a.category] || 0) + v;
   });
   return Object.entries(byCategory)
@@ -2064,6 +2142,10 @@ function overallPortfolioXIRR() {
     const amt = toBaseCurrency(t.amount || 0, a.currency);
     return { date: t.date, amount: (t.type === 'buy' || t.type === 'contribution') ? -amt : amt };
   })); });
+  // Exclude unconvertible (missing FX rate) legs from the pooled portfolio XIRR rather
+  // than letting one bad leg (now non-finite, see toBaseCurrency()) null out the whole
+  // result — the affected asset is separately flagged via Health Check.
+  allCfs = allCfs.filter(cf => Number.isFinite(cf.amount));
   const cv = totalAssets();
   if (cv > 0) allCfs.push({ date: todayISO(), amount: cv });
   if (allCfs.length < 2) return null;
@@ -2075,6 +2157,8 @@ function purposeXIRR(purpose) {
   let cfs = [];
   const assetsInPurpose = state.assets.filter(a => a.purpose === purpose);
   assetsInPurpose.forEach(a => { cfs = cfs.concat(assetCashflows(a)); });
+  // Exclude unconvertible (missing FX rate) legs — see overallPortfolioXIRR().
+  cfs = cfs.filter(cf => Number.isFinite(cf.amount));
   if (cfs.length < 2) return null;
   return xirr(cfs);
 }
@@ -2140,7 +2224,7 @@ function loanCompositionClass(loanCategory) { return LOAN_COMPOSITION_MAP[loanCa
 
 function assetComposition() {
   const buckets = { Growth: 0, Defensive: 0, Liquid: 0, Other: 0 };
-  state.assets.forEach(a => { buckets[assetCompositionClass(a.category)] += assetCurrentValue(a); });
+  state.assets.forEach(a => { const v = assetCurrentValue(a); if (Number.isFinite(v)) buckets[assetCompositionClass(a.category)] += v; });
   const total = Object.values(buckets).reduce((s, v) => s + v, 0);
   return ['Growth', 'Defensive', 'Liquid', 'Other']
     .map(label => ({ label, value: buckets[label], pct: total > 0 ? (buckets[label] / total) * 100 : 0, color: compositionColor(label) }))
@@ -2169,7 +2253,7 @@ function liabilityComposition() {
 function assetLiquidityBreakdown() {
   const total = totalAssets();
   const buckets = {};
-  state.assets.forEach(a => { const l = assetLiquidity(a); buckets[l] = (buckets[l] || 0) + assetCurrentValue(a); });
+  state.assets.forEach(a => { const l = assetLiquidity(a); const v = assetCurrentValue(a); if (Number.isFinite(v)) buckets[l] = (buckets[l] || 0) + v; });
   return ASSET_LIQUIDITY_LEVELS.map((label, i) => ({ label, value: buckets[label] || 0, pct: total > 0 ? ((buckets[label] || 0) / total) * 100 : 0, color: PALETTE[i % PALETTE.length] }))
     .filter(x => x.value > 0);
 }
@@ -2177,12 +2261,12 @@ const RISK_CHART_COLORS = ['var(--chart-risk-1)', 'var(--chart-risk-2)', 'var(--
 function assetRiskBreakdown() {
   const total = totalAssets();
   const buckets = {};
-  state.assets.forEach(a => { const r = assetRisk(a); buckets[r] = (buckets[r] || 0) + assetCurrentValue(a); });
+  state.assets.forEach(a => { const r = assetRisk(a); const v = assetCurrentValue(a); if (Number.isFinite(v)) buckets[r] = (buckets[r] || 0) + v; });
   return [1, 2, 3, 4, 5].map((n, i) => ({ label: `${n} — ${riskLabel(n)}`, value: buckets[n] || 0, pct: total > 0 ? ((buckets[n] || 0) / total) * 100 : 0, color: RISK_CHART_COLORS[i] }))
     .filter(x => x.value > 0);
 }
 
-function overallInvested() { return state.assets.reduce((s, a) => s + assetInvested(a), 0); }
+function overallInvested() { return baseCurrencySum(state.assets, a => assetInvested(a)); }
 function overallEarliestTransactionDate() {
   let earliest = null;
   state.assets.forEach(a => a.transactions.forEach(t => { if (!earliest || t.date < earliest) earliest = t.date; }));
@@ -2371,6 +2455,7 @@ function monthlyCashflow(monthsBack = 12) {
       const b = bucket(t.date);
       if (!b) return;
       const amt = toBaseCurrency(t.amount || 0, a.currency);
+      if (!Number.isFinite(amt)) return; // unconvertible FX — excluded, not silently 1:1
       if (t.type === 'buy' || t.type === 'contribution') b.out += amt;
       else if (t.type === 'sell' || t.type === 'withdrawal') b.in += amt;
     });
@@ -2389,7 +2474,7 @@ function monthlyCashflow(monthsBack = 12) {
    infers "Immediate"), but now correct for e.g. a stock held specifically as an emergency
    fund, or a savings account earmarked as illiquid. */
 function liquidAssetsTotal() {
-  return state.assets.reduce((s, a) => s + (assetLiquidity(a) === 'Immediate' ? assetCurrentValue(a) : 0), 0);
+  return baseCurrencySum(state.assets, a => (assetLiquidity(a) === 'Immediate' ? assetCurrentValue(a) : 0));
 }
 function obligationsDueWithin(days) {
   const cutoff = addDays(todayISO(), days);
@@ -2423,8 +2508,10 @@ function issuerConcentration() {
     if (!a.issuer) return;
     const key = a.issuer.trim().toLowerCase();
     if (!key) return;
+    const v = assetCurrentValue(a);
+    if (!Number.isFinite(v)) return; // unconvertible FX — excluded, not silently 1:1
     if (!byIssuer[key]) byIssuer[key] = { label: a.issuer.trim(), value: 0 };
-    byIssuer[key].value += assetCurrentValue(a);
+    byIssuer[key].value += v;
   });
   const top = Object.values(byIssuer).sort((a, b) => b.value - a.value)[0];
   return top ? { label: top.label, pct: (top.value / total) * 100 } : null;
@@ -2595,7 +2682,7 @@ function renderDonut(container, data, opts = {}) {
       legendItems[i].classList.add('active');
       legendItems.forEach((it, j) => { if (j !== i) it.style.opacity = '0.5'; });
     }
-    if (evt) showChartTooltip(evt, `<strong>${d.label}</strong><br><span class="num">${fmtINR(d.value)} · ${d.pct.toFixed(1)}%</span>${opts.onSegmentClick ? '<br><span style="font-size:10px;opacity:0.7;">Click to view details</span>' : ''}`);
+    if (evt) showChartTooltip(evt, `<strong>${escapeHTML(d.label)}</strong><br><span class="num">${fmtINR(d.value)} · ${d.pct.toFixed(1)}%</span>${opts.onSegmentClick ? '<br><span style="font-size:10px;opacity:0.7;">Click to view details</span>' : ''}`);
   }
   function resetHighlight() {
     circles.forEach(c => { c.style.filter = ''; c.style.opacity = ''; c.style.transform = 'rotate(-90deg)'; });
@@ -2684,7 +2771,7 @@ function renderTrendLine(container, snapshots) {
     dot.addEventListener('mouseenter', (e) => {
       dot.setAttribute('r', '5.5');
       const label = s.periodLabel || fmtDate(s.date);
-      showChartTooltip(e, `<strong>${label}</strong><br><span class="num">${fmtINR(s.netWorth)}</span>`);
+      showChartTooltip(e, `<strong>${escapeHTML(label)}</strong><br><span class="num">${fmtINR(s.netWorth)}</span>`);
     });
     dot.addEventListener('mousemove', (e) => moveChartTooltip(e));
     dot.addEventListener('mouseleave', () => { dot.setAttribute('r', i === sorted.length - 1 ? '4' : '3'); hideChartTooltip(); });
@@ -2741,6 +2828,7 @@ function netContributionsInRange(fromDateExclusive, toDateInclusive) {
     a.transactions.forEach(t => {
       if (t.date > fromDateExclusive && t.date <= toDateInclusive) {
         const amt = toBaseCurrency(t.amount || 0, a.currency);
+        if (!Number.isFinite(amt)) return; // unconvertible FX — excluded, not silently 1:1
         const inflow = (t.type === 'buy' || t.type === 'contribution');
         total += inflow ? amt : -amt;
       }
@@ -2773,6 +2861,7 @@ function attributionBySource(fromDateExclusive, toDateInclusive) {
     a.transactions.forEach(t => {
       if (t.date > fromDateExclusive && t.date <= toDateInclusive) {
         const amt = toBaseCurrency(t.amount || 0, a.currency);
+        if (!Number.isFinite(amt)) return; // unconvertible FX — excluded, not silently 1:1
         const inflow = (t.type === 'buy' || t.type === 'contribution');
         const key = t.source && buckets.hasOwnProperty(t.source) ? t.source : 'Regular';
         buckets[key] += inflow ? amt : -amt;
@@ -2788,7 +2877,7 @@ function attributionBySource(fromDateExclusive, toDateInclusive) {
 function foreignCurrencyExposure() {
   const total = totalAssets();
   const foreign = state.assets.filter(a => a.currency && a.currency !== state.settings.baseCurrency);
-  const value = foreign.reduce((s, a) => s + assetCurrentValue(a), 0);
+  const value = baseCurrencySum(foreign, a => assetCurrentValue(a));
   return { value, pct: total > 0 ? (value / total) * 100 : 0, count: foreign.length };
 }
 
@@ -2833,6 +2922,12 @@ function healthCheckFindings() {
     }
     if (assetCurrentValue(a) < 0) {
       push('adverse', 'Negative Balance', a.name, `Current value is negative (${fmtINR(assetCurrentValue(a))}).`, t, 'Assets');
+    }
+    if (a.currency && a.currency !== state.settings.baseCurrency) {
+      const rate = state.settings.exchangeRates[a.currency];
+      if (!Number.isFinite(rate) || rate <= 0) {
+        push('adverse', 'Missing FX Rate', a.name, `No exchange rate set for ${a.currency} → ${state.settings.baseCurrency}. This holding is excluded from Net Worth and all totals until a rate is added in Settings.`, t, 'Assets');
+      }
     }
   });
 
@@ -3015,8 +3110,8 @@ function wealthAlertsHTML() {
   const rows = alerts.map(a => `
     <div class="flex-between" style="padding:13px 18px;border-bottom:1px solid var(--border-soft);border-left:3px solid ${semanticColorVar(a.sem)};background:linear-gradient(90deg, ${semanticDimColorVar(a.sem)}, transparent 40%);${a.onClick ? 'cursor:pointer;' : ''}" ${a.onClick ? `onclick="${a.onClick}"` : ''}>
       <div>
-        <div style="font-size:13px;color:${semanticColorVar(a.sem)};font-weight:600;"><span style="display:inline-block;width:15px;">${semanticIcon(a.sem)}</span>${a.title}</div>
-        <div class="jn" style="margin-top:3px;margin-left:15px;color:var(--text-muted);font-family:var(--font-body);">${a.detail}</div>
+        <div style="font-size:13px;color:${semanticColorVar(a.sem)};font-weight:600;"><span style="display:inline-block;width:15px;">${semanticIcon(a.sem)}</span>${escapeHTML(a.title)}</div>
+        <div class="jn" style="margin-top:3px;margin-left:15px;color:var(--text-muted);font-family:var(--font-body);">${escapeHTML(a.detail)}</div>
       </div>
     </div>`).join('');
   const overflowRow = overflowText ? `<div style="padding:10px 18px;text-align:center;" class="jn">${overflowText} not shown — lower priority than the ones above</div>` : '';
@@ -3126,7 +3221,7 @@ function renderSunburst(svgId, detailId, classes) {
         const seg = svgN('path',{d:arc(INNER_R+3,MID_R-2,cA1,cA2),fill:cl.color,opacity:'0.88',stroke:'var(--bg)','stroke-width':'1.5',style:`cursor:pointer;transition:filter .12s,transform .15s var(--ease,ease),opacity .15s;transform-origin:${origin};`});
         seg.dataset.baseOpacity = '0.88';
         segEls.push(seg);
-        seg.onmouseenter = e => { seg.style.filter='brightness(1.22)'; ringZoomIn(seg, segEls); showChartTooltip(e,`<strong>${cl.label}</strong><br>${fmtINR(cl.value)} · ${(cFrac*100).toFixed(1)}%<br><span style="font-size:10px;opacity:.7">Click to zoom in</span>`); };
+        seg.onmouseenter = e => { seg.style.filter='brightness(1.22)'; ringZoomIn(seg, segEls); showChartTooltip(e,`<strong>${escapeHTML(cl.label)}</strong><br>${fmtINR(cl.value)} · ${(cFrac*100).toFixed(1)}%<br><span style="font-size:10px;opacity:.7">Click to zoom in</span>`); };
         seg.onmousemove = moveChartTooltip;
         seg.onmouseleave = () => { seg.style.filter=''; ringZoomOut(seg, segEls); hideChartTooltip(); };
         seg.onclick = () => { zoomed=cl.label; draw(cl.label); updateDetail(cl); };
@@ -3154,7 +3249,7 @@ function renderSunburst(svgId, detailId, classes) {
         const hseg = svgN('path',{d:arc(iR,oR,hA1,hA2),fill:cl.color,opacity:alpha,stroke:'var(--bg)','stroke-width':'1',style:`cursor:pointer;transition:filter .12s,opacity .15s,transform .15s var(--ease,ease);transform-origin:${origin};`});
         hseg.dataset.baseOpacity = alpha;
         hsegEls.push(hseg);
-        hseg.onmouseenter = e => { hseg.style.filter='brightness(1.25)'; hseg.style.opacity='1'; ringZoomIn(hseg, hsegEls); showChartTooltip(e,`<strong>${h.label}</strong>${h.sub?`<br><span style="opacity:.7">${h.sub}</span>`:''}<br>${fmtINR(h.value)}<br>${(h.value/total*100).toFixed(1)}% of total`); };
+        hseg.onmouseenter = e => { hseg.style.filter='brightness(1.25)'; hseg.style.opacity='1'; ringZoomIn(hseg, hsegEls); showChartTooltip(e,`<strong>${escapeHTML(h.label)}</strong>${h.sub?`<br><span style="opacity:.7">${escapeHTML(h.sub)}</span>`:''}<br>${fmtINR(h.value)}<br>${(h.value/total*100).toFixed(1)}% of total`); };
         hseg.onmousemove = moveChartTooltip;
         hseg.onmouseleave = () => { hseg.style.filter=''; ringZoomOut(hseg, hsegEls); hideChartTooltip(); };
         hseg.onclick = () => { zoomed=cl.label; draw(cl.label); updateDetail(cl); };
@@ -3239,7 +3334,7 @@ function renderTreemap() {
         holdRects.forEach(({item:h,x:hx,y:hy,w:hw,h:hh})=>{
           if(hw<3||hh<3)return;
           const r=svgN('rect',{x:hx+1,y:hy+1,width:Math.max(0,hw-2),height:Math.max(0,hh-2),fill:cat.color,opacity:'.6',rx:'2',style:'cursor:pointer;transition:opacity .12s,filter .12s;'});
-          r.onmouseenter=e=>{r.setAttribute('opacity','1');r.style.filter='brightness(1.2)';showChartTooltip(e,`<strong>${h.label}</strong><br>${fmtINR(h.value)}<br>${cat.label}<br>${(h.value/tA*100).toFixed(1)}% of portfolio`);};
+          r.onmouseenter=e=>{r.setAttribute('opacity','1');r.style.filter='brightness(1.2)';showChartTooltip(e,`<strong>${escapeHTML(h.label)}</strong><br>${fmtINR(h.value)}<br>${escapeHTML(cat.label)}<br>${(h.value/tA*100).toFixed(1)}% of portfolio`);};
           r.onmousemove=moveChartTooltip; r.onmouseleave=()=>{r.setAttribute('opacity','.6');r.style.filter='';hideChartTooltip();};
           svg.appendChild(r);
           if(hw>50&&hh>16){const lt=svgN('text',{x:hx+hw/2,y:hy+hh/2+4,'text-anchor':'middle','font-size':hw>90?'9':'7.5',fill:'#fff','pointer-events':'none'});lt.textContent=hw>100?h.label:h.label.split(' ')[0];svg.appendChild(lt);}
@@ -3260,7 +3355,7 @@ function renderTreemap() {
       rects.forEach(({item:h,x,y,w,h:hh},i)=>{
         const alpha=(0.45+(i/Math.max(cat.assets.length,1))*0.5).toFixed(2);
         const r=svgN('rect',{x:x+1,y:y+1,width:Math.max(0,w-2),height:Math.max(0,hh-2),fill:cat.color,opacity:alpha,rx:'3',style:'cursor:pointer;transition:filter .12s;'});
-        r.onmouseenter=e=>{r.style.filter='brightness(1.22)';r.setAttribute('opacity','1');showChartTooltip(e,`<strong>${h.label}</strong><br>${fmtINR(h.value)}<br>${(h.value/catVal*100).toFixed(1)}% of ${zCat}<br>${(h.value/tA*100).toFixed(1)}% of portfolio`);};
+        r.onmouseenter=e=>{r.style.filter='brightness(1.22)';r.setAttribute('opacity','1');showChartTooltip(e,`<strong>${escapeHTML(h.label)}</strong><br>${fmtINR(h.value)}<br>${(h.value/catVal*100).toFixed(1)}% of ${escapeHTML(zCat)}<br>${(h.value/tA*100).toFixed(1)}% of portfolio`);};
         r.onmousemove=moveChartTooltip;
         r.onmouseleave=()=>{r.style.filter='';r.setAttribute('opacity',alpha);hideChartTooltip();};
         r.onclick=()=>{
@@ -3470,7 +3565,7 @@ function renderPackedCircles(canvasId, items, onClickFn) {
     const rect=canvas.getBoundingClientRect(),mx=(e.clientX-rect.left)*(W/rect.width),my=(e.clientY-rect.top)*(H/rect.height);
     const found=circles.findIndex(c=>Math.hypot(c.x-mx,c.y-my)<c.r);
     if(found!==hov){hov=found;draw(hov);
-      if(hov>=0){const c=circles[hov];showChartTooltip(e,`<strong>${c.label}</strong>${c.sub?`<br><span style="opacity:.7">${c.sub}</span>`:''}<br>${fmtINR(c.value)}<br>${c.pct?c.pct.toFixed(1)+'% of portfolio':''}<div style="font-size:10px;opacity:.6;margin-top:2px;">Click for details</div>`);}
+      if(hov>=0){const c=circles[hov];showChartTooltip(e,`<strong>${escapeHTML(c.label)}</strong>${c.sub?`<br><span style="opacity:.7">${escapeHTML(c.sub)}</span>`:''}<br>${fmtINR(c.value)}<br>${c.pct?c.pct.toFixed(1)+'% of portfolio':''}<div style="font-size:10px;opacity:.6;margin-top:2px;">Click for details</div>`);}
       else hideChartTooltip();
     } else if(hov>=0) moveChartTooltip(e);
   };
@@ -3733,13 +3828,14 @@ function renderDashboard() {
 
   // Item 13: Donut click handlers — show underlying assets/liabilities for clicked segment
   function openDonutDrilldown(title, rows) {
-    // rows: [{ name, sub, value }]
+    // rows: [{ name, sub, value }] — title/seg.label and sub/category are user-renameable
+    // master-data category names, not fixed system strings, so both need escaping too.
     openModal(`
-      <h3>${title}</h3>
+      <h3>${escapeHTML(title)}</h3>
       <div class="card" style="padding:0;max-height:420px;overflow-y:auto;">
         ${rows.length
           ? rows.map(r => `<div class="flex-between" style="padding:10px 16px;border-bottom:1px solid var(--border-soft);">
-              <div><div style="font-size:13px;">${r.name}</div>${r.sub ? `<div class="jn" style="margin-top:2px;">${r.sub}</div>` : ''}</div>
+              <div><div style="font-size:13px;">${escapeHTML(r.name)}</div>${r.sub ? `<div class="jn" style="margin-top:2px;">${escapeHTML(r.sub)}</div>` : ''}</div>
               <div class="num">${fmtINR(r.value)}</div>
             </div>`).join('')
           : `<div class="empty-state">No items in this segment.</div>`}
@@ -4052,7 +4148,7 @@ function goalAllocationTableHTML() {
     const dev = Math.abs(r.deviationPct);
     const sem = dev < 3 ? 'neutral' : dev < 8 ? 'caution' : 'adverse';
     return `<tr>
-      <td>${r.purpose}</td>
+      <td>${escapeHTML(r.purpose)}</td>
       <td class="num">${r.targetPct ? r.targetPct.toFixed(1) + '%' : '—'}</td>
       <td class="num">${r.actualPct.toFixed(1)}%</td>
       <td class="num ${semanticClass(sem)}">${fmtPct(r.deviationPct)}</td>
@@ -4071,7 +4167,7 @@ function creditUtilizationSummaryHTML() {
     const u = creditCardUtilization(c);
     const b = creditUtilizationBand(u);
     return `<div class="flex-between" style="padding:8px 0;border-bottom:1px solid var(--border-soft);">
-      <span class="jn">${c.name}</span>
+      <span class="jn">${escapeHTML(c.name)}</span>
       <span class="num ${semanticClass(b.sem)}">${u.toFixed(0)}%</span>
     </div>`;
   }).join('');
@@ -4501,8 +4597,8 @@ function renderAssetsTableOnly() {
         return viewPrefs.sortDir === 'asc' ? vx - vy : vy - vx;
       });
     }
-    const catInvested = assetsInCat.reduce((s, a) => s + assetInvested(a), 0);
-    const catValue = assetsInCat.reduce((s, a) => s + assetCurrentValue(a), 0);
+    const catInvested = baseCurrencySum(assetsInCat, a => assetInvested(a));
+    const catValue = baseCurrencySum(assetsInCat, a => assetCurrentValue(a));
     const catPct = totalA > 0 ? (catValue / totalA) * 100 : 0;
     const catGain = catValue - catInvested;
     const catGainPct = categoryGainPct(assetsInCat, catInvested, catValue);
@@ -4653,7 +4749,7 @@ function assetRowHTML(a, totalA) {
           <button class="row-toggle-btn" data-row-toggle="${a.id}" title="${isOpen ? 'Collapse' : 'Expand'} ${escapeAttr(a.name)}" style="width:19px;height:19px;padding:0;flex:none;font-size:13px;line-height:1;display:inline-flex;align-items:center;justify-content:center;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--surface-alt);color:var(--text-muted);cursor:pointer;">${isOpen ? '−' : '+'}</button>
           <span class="avatar-chip" style="color:${categoryColor(a.category)};border-color:${categoryColor(a.category)}55;">${initials}</span>
           <div>
-            <div>${a.name}</div>
+            <div>${escapeHTML(a.name)}</div>
             <div class="jn" style="margin-top:2px;">${assetLiquidity(a)} · Risk ${assetRisk(a)} — ${riskLabel(assetRisk(a))}</div>
           </div>
         </div>
@@ -4701,7 +4797,7 @@ function assetDetailsExtraHTML(a) {
   if (a.nominee) rows.push(['Nominee', a.nominee]);
   if (a.notes) rows.push(['Notes', a.notes]);
   return `<div class="jn" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:6px 16px;margin-bottom:14px;padding:10px 12px;background:var(--bg-alt);border-radius:var(--radius);">
-    ${rows.map(([label, value]) => `<div><span style="color:var(--text-dim);">${label}:</span> <span style="color:var(--text-muted);">${value}</span></div>`).join('')}
+    ${rows.map(([label, value]) => `<div><span style="color:var(--text-dim);">${label}:</span> <span style="color:var(--text-muted);">${escapeHTML(value)}</span></div>`).join('')}
   </div>`;
 }
 
@@ -4727,8 +4823,8 @@ function assetDetailRowHTML(a) {
   <tr class="detail-row open"><td colspan="7">
     <div class="flex-between" style="margin-bottom:14px;">
       <div>
-        <div style="font-family:var(--font-display);font-size:15px;">${a.name}</div>
-        <div class="jn" style="margin-top:2px;">${a.category}${a.hasUnits ? ' · ' + (a.unitLabel || 'units') : ''}</div>
+        <div style="font-family:var(--font-display);font-size:15px;">${escapeHTML(a.name)}</div>
+        <div class="jn" style="margin-top:2px;">${escapeHTML(a.category)}${a.hasUnits ? ' · ' + (a.unitLabel || 'units') : ''}</div>
       </div>
       <div class="btn-row">
         ${a.hasUnits
@@ -4767,7 +4863,7 @@ function ledgerAssetDetailRowHTML(a) {
   const rows = ledgerRunningRows(a);
   const txRows = rows.map(t => `<tr>
       <td>${fmtDate(t.date)}</td>
-      <td>${t.note ? t.note : (t.type === 'contribution' ? 'Deposit' : 'Withdrawal')}</td>
+      <td>${t.note ? escapeHTML(t.note) : (t.type === 'contribution' ? 'Deposit' : 'Withdrawal')}</td>
       <td class="num ${t.debit ? 'loss' : ''}">${t.debit ? fmtINR(t.debit) : '—'}</td>
       <td class="num ${t.credit ? 'gain' : ''}">${t.credit ? fmtINR(t.credit) : '—'}</td>
       <td class="num">${fmtINR(t.balance)}</td>
@@ -4780,8 +4876,8 @@ function ledgerAssetDetailRowHTML(a) {
   <tr class="detail-row open"><td colspan="7">
     <div class="flex-between" style="margin-bottom:14px;">
       <div>
-        <div style="font-family:var(--font-display);font-size:15px;">${a.name}</div>
-        <div class="jn" style="margin-top:2px;">${a.category} · Bank-statement ledger · Opening balance ${fmtINR(a.openingBalance || 0)}</div>
+        <div style="font-family:var(--font-display);font-size:15px;">${escapeHTML(a.name)}</div>
+        <div class="jn" style="margin-top:2px;">${escapeHTML(a.category)} · Bank-statement ledger · Opening balance ${fmtINR(a.openingBalance || 0)}</div>
       </div>
       <div class="btn-row">
         <button class="btn btn-sm" data-add-tx="${a.id}">+ Add Entry</button>
@@ -4954,7 +5050,7 @@ function openAssetFormModal(existingAsset) {
         <label>Start from Template <span class="hint" style="text-transform:none;">optional</span></label>
         <select id="f-template">
           <option value="">— Blank asset —</option>
-          ${state.assetTemplates.map(t => `<option value="${t.id}">${t.name}</option>`).join('')}
+          ${state.assetTemplates.map(t => `<option value="${t.id}">${escapeHTML(t.name)}</option>`).join('')}
         </select>
       </div>
       <div class="field">
@@ -5250,7 +5346,7 @@ function openTransactionFormModal(assetId, existingTx) {
   const isEdit = !!existingTx;
   openModal(`
     <h3>${isEdit ? 'Edit Transaction' : 'Add Transaction'}</h3>
-    <div class="modal-sub">${asset.name}</div>
+    <div class="modal-sub">${escapeHTML(asset.name)}</div>
     <div class="field">
       <label>Type</label>
       <select id="f-type">
@@ -5299,7 +5395,10 @@ function openTransactionFormModal(assetId, existingTx) {
       const source = modal.querySelector('#f-source').value;
       if (isEdit) {
         Object.assign(existingTx, { date: baseDate, type, qty, price, amount, source });
-        if (asset.hasUnits && price) { asset.currentPrice = price; asset.lastUpdated = baseDate; }
+        // A transaction's price is HISTORICAL cost-basis data, not a live market quote —
+        // asset.currentPrice must only change via an explicit Update Price action or a
+        // live-price refresh (see openUpdatePriceModal/maybeAutoRefreshLivePrices), never
+        // as a side effect of logging/editing a buy or sell here (Phase 5 hardening).
         logTransaction('edit', 'Transaction', asset.name, `${type} · ${fmtINR(amount)} on ${fmtDate(baseDate)}`);
         await Storage.save(state);
         closeModal();
@@ -5312,7 +5411,7 @@ function openTransactionFormModal(assetId, existingTx) {
       dates.forEach(date => {
         asset.transactions.push({ id: uid(), date, type, qty, price, amount, source });
       });
-      if (asset.hasUnits && price) { asset.currentPrice = price; asset.lastUpdated = dates[dates.length - 1]; }
+      // See "isEdit" branch above — transaction price is historical, never mutates currentPrice.
       logTransaction('add', 'Transaction', asset.name, `${type} · ${fmtINR(amount)}${dates.length > 1 ? ` × ${dates.length}` : ' on ' + fmtDate(baseDate)}`);
       await Storage.save(state);
       closeModal();
@@ -5336,7 +5435,7 @@ function openLedgerEntryFormModal(assetId, existingTx) {
   const isEdit = !!existingTx;
   openModal(`
     <h3>${isEdit ? 'Edit Ledger Entry' : 'Add Ledger Entry'}</h3>
-    <div class="modal-sub">${asset.name}</div>
+    <div class="modal-sub">${escapeHTML(asset.name)}</div>
     <div class="field"><label>Description</label><input id="f-note" placeholder="e.g. Salary credit, ATM withdrawal, UPI transfer" value="${isEdit ? (existingTx.note || '') : ''}" /></div>
     <div class="field-row">
       <div class="field"><label>Date</label><input type="date" id="f-date" value="${isEdit ? existingTx.date : todayISO()}" /></div>
@@ -5394,10 +5493,16 @@ function openEditLedgerEntryModal(assetId, txId) {
 }
 
 async function applyAssetPriceUpdate(asset, priceVal, dateVal) {
-  asset.currentPrice = parseFloat(priceVal) || 0;
+  const price = parseFloat(priceVal);
+  // A per-unit price can't legitimately be negative, and a silent `|| 0` fallback would mask
+  // a bad/blank input as "price is now zero" -- reject and tell the user instead (Phase 6
+  // hardening). Zero itself is allowed (e.g. a written-off holding).
+  if (!Number.isFinite(price) || price < 0) { showToast('Enter a valid, non-negative price'); return false; }
+  asset.currentPrice = price;
   asset.lastUpdated = dateVal || todayISO();
   await Storage.save(state);
   showToast('Price updated');
+  return true;
 }
 async function applyAssetValueUpdate(asset, valueVal, dateVal) {
   asset.currentValue = parseFloat(valueVal) || 0;
@@ -5411,7 +5516,7 @@ function openUpdatePriceModal(assetId) {
   if (!asset) return;
   openModal(`
     <h3>Update Price</h3>
-    <div class="modal-sub">${asset.name} — current qty: ${fmtNum(assetQty(asset), 3)} ${asset.unitLabel || ''}</div>
+    <div class="modal-sub">${escapeHTML(asset.name)} — current qty: ${fmtNum(assetQty(asset), 3)} ${asset.unitLabel || ''}</div>
     <div class="field"><label>Current Price per ${asset.unitLabel || 'unit'}</label><input type="number" id="f-price" step="any" value="${asset.currentPrice || ''}" /></div>
     <div class="field"><label>As of Date</label><input type="date" id="f-date" value="${todayISO()}" /></div>
     <div class="modal-actions">
@@ -5421,7 +5526,8 @@ function openUpdatePriceModal(assetId) {
   `, (modal) => {
     modal.querySelector('#f-cancel').onclick = closeModal;
     modal.querySelector('#f-save').onclick = async () => {
-      await applyAssetPriceUpdate(asset, modal.querySelector('#f-price').value, modal.querySelector('#f-date').value);
+      const ok = await applyAssetPriceUpdate(asset, modal.querySelector('#f-price').value, modal.querySelector('#f-date').value);
+      if (!ok) return;
       closeModal();
       renderAssets();
     };
@@ -5433,7 +5539,7 @@ function openUpdateValueModal(assetId) {
   if (!asset) return;
   openModal(`
     <h3>Update Current Value</h3>
-    <div class="modal-sub">${asset.name}</div>
+    <div class="modal-sub">${escapeHTML(asset.name)}</div>
     <div class="field"><label>Current Balance / Value (₹)</label><input type="number" id="f-value" step="any" value="${asset.currentValue || ''}" /></div>
     <div class="field"><label>As of Date</label><input type="date" id="f-date" value="${todayISO()}" /></div>
     <div class="modal-actions">
@@ -5471,7 +5577,8 @@ function openUpdatePricePopover(assetId, anchorEl) {
   `, (pop) => {
     pop.querySelector('#pf-cancel').onclick = closePopover;
     const save = async () => {
-      await applyAssetPriceUpdate(asset, pop.querySelector('#pf-price').value, pop.querySelector('#pf-date').value);
+      const ok = await applyAssetPriceUpdate(asset, pop.querySelector('#pf-price').value, pop.querySelector('#pf-date').value);
+      if (!ok) return;
       closePopover();
       renderAssetsTableOnly();
     };
@@ -5724,7 +5831,7 @@ function openMoveMoneyModal(defaultMode) {
         const price = priceEl.value ? parseFloat(priceEl.value) : null;
         applyMoneyMovement(fromAsset, amount, 'out', date, note || `Invested in ${toAsset.name}`, linkId);
         toAsset.transactions.push({ id: uid(), date, type: 'buy', qty, price, amount, source: 'Regular', note: note || `Funded from ${fromAsset.name}`, linkId });
-        if (price) { toAsset.currentPrice = price; toAsset.lastUpdated = date; }
+        // Historical transaction price — must not overwrite currentPrice (Phase 5 hardening).
         logTransaction('add', 'Investment', `${fromAsset.name} → ${toAsset.name}`, `${fmtINR(amount)} on ${fmtDate(date)} (via Move Money)`);
         await Storage.save(state);
         closeModal();
@@ -5740,7 +5847,7 @@ function openMoveMoneyModal(defaultMode) {
         const qty = qtyEl.value ? parseFloat(qtyEl.value) : null;
         const price = priceEl.value ? parseFloat(priceEl.value) : null;
         fromAsset.transactions.push({ id: uid(), date, type: 'sell', qty, price, amount, source: 'Regular', note: note || `Deposited to ${toAsset.name}`, linkId });
-        if (price) { fromAsset.currentPrice = price; fromAsset.lastUpdated = date; }
+        // Historical transaction price — must not overwrite currentPrice (Phase 5 hardening).
         applyMoneyMovement(toAsset, amount, 'in', date, note || `Proceeds from ${fromAsset.name}`, linkId);
         logTransaction('add', 'Divestment', `${fromAsset.name} → ${toAsset.name}`, `${fmtINR(amount)} on ${fmtDate(date)} (via Move Money)`);
         await Storage.save(state);
@@ -5783,6 +5890,10 @@ function openMoveMoneyModal(defaultMode) {
         cl.repayments.push({ id: uid(), date, amount, linkId });
         liabLabel = cl.name;
         logTransaction('add', 'Cash Loan Repayment', cl.name, `${fmtINR(amount)} on ${fmtDate(date)} (via Move Money)`);
+        // Cash loan repayments now mirror into Cash Flow the same way loan/card payments do
+        // (Phase 8 hardening — previously cash loan repayments never appeared in Cash Flow
+        // through any path).
+        mirrorAutoExpense('EMI/Loan Payment', cl.name, amount, date, fromAsset.name, `cashloan-${cl.id}-${linkId}`);
         openLiabIds.add(cl.id);
       }
       applyMoneyMovement(fromAsset, amount, 'out', date, note || `Payment: ${liabLabel}`, linkId);
@@ -5798,7 +5909,7 @@ function openMoveMoneyModal(defaultMode) {
 
 
 function openBulkImportModal() {
-  const assetOptions = state.assets.map(a => `<option value="${a.id}" data-ledger="${a.ledgerStyle ? '1' : '0'}">${a.name} (${a.category})</option>`).join('');
+  const assetOptions = state.assets.map(a => `<option value="${a.id}" data-ledger="${a.ledgerStyle ? '1' : '0'}">${escapeHTML(a.name)} (${a.category})</option>`).join('');
   const categoryOpts = categoryOptions(state.categoriesAssets);
   openModal(`
     <h3>Bulk Import Transactions</h3>
@@ -6008,7 +6119,9 @@ function openBulkImportModal() {
           if ((isNaN(amount) || !amount) && qty && price) amount = qty * price;
           if (isNaN(amount) || !amount) { skipped++; return; }
           asset.transactions.push({ id: uid(), date, type: type.toLowerCase(), qty, price, amount, note: note ? note.trim() : '' });
-          if (asset.hasUnits && price) { asset.currentPrice = price; asset.lastUpdated = date; }
+          // Imported rows are historical transactions — must not overwrite currentPrice
+          // (Phase 5 hardening). A dedicated currentPrice CSV column exists for bulk
+          // asset import (see parseMasterCSV) for explicitly setting current price.
           touchedAssets.add(asset.id);
           added++;
         });
@@ -6048,7 +6161,7 @@ function openBulkImportModal() {
           if (isNaN(amount) && qty && price) amount = qty * price;
           if (isNaN(amount) || !amount) { skipped++; return; }
           asset.transactions.push({ id: uid(), date, type: type.toLowerCase(), qty, price, amount });
-          if (price) { asset.currentPrice = price; asset.lastUpdated = date; }
+          // Historical transaction price — must not overwrite currentPrice (Phase 5 hardening).
           added++;
         });
       }
@@ -6264,7 +6377,13 @@ async function refreshAllLivePrices(manual) {
   }
   const ok = results.filter(r => r.ok).length;
   const failed = results.length - ok;
-  state.settings.livePrices.lastRefresh = today;
+  // Track last-attempted and last-successful separately (Phase 9 hardening): a completely
+  // failed refresh (ok === 0, e.g. network/API down) must not stamp `lastRefresh`, or
+  // maybeAutoRefreshLivePrices()'s once-a-day throttle below would silently block every
+  // retry for the rest of the day even though nothing actually succeeded. `lastAttempt`
+  // always records the attempt (for diagnostics / "last tried at" display).
+  state.settings.livePrices.lastAttempt = today;
+  if (ok > 0) state.settings.livePrices.lastRefresh = today;
   await Storage.save(state);
   if (ok) logTransaction('update', 'Live Prices', `${ok} asset${ok !== 1 ? 's' : ''}`, failed ? `${failed} failed — see console/results` : 'all succeeded');
 
@@ -6306,7 +6425,10 @@ async function refreshSingleAssetPrice(assetId) {
 async function maybeAutoRefreshLivePrices() {
   const cfg = state.settings.livePrices;
   if (!cfg || !cfg.autoRefreshOnOpen) return;
-  if (cfg.lastRefresh === todayISO()) return; // throttled to once/day, same pattern as auto-backup
+  // Throttled to once/day, but ONLY once a refresh has actually succeeded (at least
+  // partially) today -- see refreshAllLivePrices()'s lastAttempt/lastRefresh split. A fully
+  // failed attempt must not block the next automatic retry (Phase 9 hardening).
+  if (cfg.lastRefresh === todayISO()) return;
   await refreshAllLivePrices(false);
   await refreshLiveExchangeRates(false);
 }
@@ -6719,7 +6841,7 @@ function renderLiabAll() {
   const bulkBar = liabSelectMode && selCount ? `<div class="flex-between block"><span style="font-size:13px;">${selCount} selected</span><button class="btn btn-sm btn-danger" id="btn-liab-bulk-delete" style="border-color:var(--red);">Delete Selected</button></div>` : '';
   const rows = list.map(x => `<tr class="data-row" data-liab-row="${x.kind}:${x.id}">
       ${liabSelectMode ? `<td style="width:36px;" onclick="event.stopPropagation();"><input type="checkbox" class="liab-select-cb" data-liab-cb="${x.kind}:${x.id}" ${selectedLiabIds.has(x.kind + ':' + x.id) ? 'checked' : ''} /></td>` : ''}
-      <td><div>${x.name}</div><div class="jn" style="margin-top:2px;">${liabKindLabel(x.kind)}${x.category && x.category !== x.name ? ' · ' + x.category : ''}</div></td>
+      <td><div>${escapeHTML(x.name)}</div><div class="jn" style="margin-top:2px;">${liabKindLabel(x.kind)}${x.category && x.category !== x.name ? ' · ' + x.category : ''}</div></td>
       <td class="num ${x.value > 0 ? 'loss' : ''}">${fmtINR(x.value)}</td>
     </tr>`).join('');
   wrap.innerHTML = liabUpcomingHighlightHTML() + toolbar + bulkBar + `
@@ -6767,16 +6889,23 @@ async function bulkDeleteLiabilities(keys) {
   let count = 0;
   keys.forEach(k => {
     const [kind, id] = k.split(':');
-    if (kind === 'creditcards') { const x = state.creditCards.find(v => v.id === id); if (x) { logAudit('delete', 'Credit Card', x.name); count++; } state.creditCards = state.creditCards.filter(v => v.id !== id); }
-    else if (kind === 'loans') { const x = state.loans.find(v => v.id === id); if (x) { logAudit('delete', 'Loan/EMI', x.name); count++; } state.loans = state.loans.filter(v => v.id !== id); }
-    else if (kind === 'cashloans') { const x = state.cashLoans.find(v => v.id === id); if (x) { logAudit('delete', 'Cash Loan', x.name); count++; } state.cashLoans = state.cashLoans.filter(v => v.id !== id); }
-    else if (kind === 'bills') { const x = state.bills.find(v => v.id === id); if (x) { logAudit('delete', 'Bill', x.name || x.category); count++; } state.bills = state.bills.filter(v => v.id !== id); }
+    // Clean up any mirrored Cash Flow entries for each deleted record — same prefix schemes
+    // used by the single-item delete functions above (Phase 7/8 hardening).
+    if (kind === 'creditcards') {
+      const x = state.creditCards.find(v => v.id === id);
+      if (x) { logAudit('delete', 'Credit Card', x.name); count++; (x.bills || []).forEach(b => unmirrorAutoExpensesByPrefix(`cardbill-${b.id}`)); }
+      state.creditCards = state.creditCards.filter(v => v.id !== id);
+    }
+    else if (kind === 'loans') { const x = state.loans.find(v => v.id === id); if (x) { logAudit('delete', 'Loan/EMI', x.name); count++; unmirrorAutoExpensesByPrefix(`loan-${id}-`); } state.loans = state.loans.filter(v => v.id !== id); }
+    else if (kind === 'cashloans') { const x = state.cashLoans.find(v => v.id === id); if (x) { logAudit('delete', 'Cash Loan', x.name); count++; unmirrorAutoExpensesByPrefix(`cashloan-${id}-`); } state.cashLoans = state.cashLoans.filter(v => v.id !== id); }
+    else if (kind === 'bills') { const x = state.bills.find(v => v.id === id); if (x) { logAudit('delete', 'Bill', x.name || x.category); count++; unmirrorAutoExpensesByPrefix(`bill-${id}-`); } state.bills = state.bills.filter(v => v.id !== id); }
     openLiabIds.delete(id);
   });
   selectedLiabIds.clear(); liabSelectMode = false;
   await Storage.save(state);
   showToast(`${count} liabilit${count !== 1 ? 'ies' : 'y'} deleted`);
   renderLiabilities();
+  renderDashboard();
 }
 
 /* ---------- Bill subtabs: Tax Payable / Utility and Bills / Subscriptions (Item C.4-6) ---------- */
@@ -6812,7 +6941,7 @@ function renderBillsSubtab(type) {
     rows += `<tr class="data-row" id="bill-row-${b.id}">
       ${liabSelectMode ? `<td style="width:36px;" onclick="event.stopPropagation();"><input type="checkbox" class="liab-select-cb" data-liab-cb="bills:${b.id}" ${selectedLiabIds.has('bills:' + b.id) ? 'checked' : ''} /></td>` : ''}
       <td>
-        <div>${b.name ? b.name + ' — ' : ''}${b.category}</div>
+        <div>${b.name ? b.name + ' — ' : ''}${escapeHTML(b.category)}</div>
         <div class="jn ${b.status === 'paid' ? 'sem-favorable' : (b.dueDate < todayISO() ? 'sem-adverse' : 'sem-neutral')}" style="margin-top:2px;">${b.status === 'paid' ? 'Paid' : (b.dueDate < todayISO() ? 'Overdue' : 'Due')} · ${fmtDate(b.dueDate)}${b.recurring !== 'none' ? ' · ' + billRecurringLabel(b.recurring) : ''}</div>
       </td>
       <td class="num ${outstanding > 0 ? 'loss' : ''}">${fmtINR(outstanding)}</td>
@@ -6856,7 +6985,7 @@ function billDetailHTML(b) {
   return `<tr class="detail-row open"><td colspan="3">
     <div class="flex-between" style="margin-bottom:14px;flex-wrap:wrap;gap:10px;">
       <div>
-        <div style="font-family:var(--font-display);font-size:15px;">${b.name ? b.name + ' — ' : ''}${b.category}</div>
+        <div style="font-family:var(--font-display);font-size:15px;">${b.name ? b.name + ' — ' : ''}${escapeHTML(b.category)}</div>
         <div class="jn">${cfg.label} · ${billRecurringLabel(b.recurring)}${b.notes ? ' · ' + b.notes : ''}</div>
       </div>
       <div class="btn-row">
@@ -6890,17 +7019,28 @@ async function markBillUnpaid(id) {
   const b = state.bills.find(x => x.id === id);
   if (!b) return;
   b.status = 'due';
+  // Undo the most recently recorded payment (if any): pop its history entry and remove the
+  // Cash Flow entry mirrorAutoExpense() created for it, or that entry would be left behind
+  // as a stale automatic expense with no corresponding "paid" record (Phase 7 hardening).
+  const lastPaid = (b.history || []).length ? b.history[b.history.length - 1] : null;
+  if (lastPaid) {
+    b.history.pop();
+    unmirrorAutoExpense(`bill-${b.id}-${lastPaid.date}`);
+  }
   logTransaction('update', 'Bill', b.name || b.category, 'Marked unpaid');
-  await Storage.save(state); showToast('Marked as unpaid'); renderLiabilities();
+  await Storage.save(state); showToast('Marked as unpaid'); renderLiabilities(); renderDashboard();
 }
 async function deleteLiabilityBill(id) {
   const b = state.bills.find(x => x.id === id);
   if (!b) return;
   if (!confirm(`Delete "${b.name || b.category}"? This cannot be undone.`)) return;
   logAudit('delete', 'Bill', b.name || b.category);
+  // Every paid instance of this bill was mirrored as `bill-<id>-<date>` (see markBillPaid) --
+  // remove all of them by prefix now that the parent record itself is gone (Phase 7 hardening).
+  unmirrorAutoExpensesByPrefix(`bill-${b.id}-`);
   state.bills = state.bills.filter(x => x.id !== id);
   openLiabIds.delete(id);
-  await Storage.save(state); showToast('Deleted'); renderLiabilities();
+  await Storage.save(state); showToast('Deleted'); renderLiabilities(); renderDashboard();
 }
 function openBillModal(type, existing) {
   const cfg = BILL_TYPE_CONFIG[type];
@@ -6986,7 +7126,7 @@ function renderCreditCards() {
           <div class="row-name">
             <span class="avatar-chip">${c.name.trim().split(/\s+/).slice(0,2).map(w=>w[0]).join('').toUpperCase()}</span>
             <div>
-              <div>${c.name}</div>
+              <div>${escapeHTML(c.name)}</div>
               ${util !== null ? `<div class="jn ${semanticClass(utilBand.sem)}" style="margin-top:2px;">${util.toFixed(0)}% of ${fmtINR(c.creditLimit)} limit</div>` : ''}
             </div>
           </div>
@@ -7065,14 +7205,14 @@ function creditCardDetailHTML(c) {
     linkedEMIsHTML = `
       <div class="jn" style="margin:14px 0 8px;text-transform:uppercase;letter-spacing:0.06em;">Linked EMIs <span style="font-weight:400;text-transform:none;letter-spacing:0;">— counted against this card's limit, tracked as their own Loan/EMI entries</span></div>
       <table class="ledger"><thead><tr><th>EMI</th><th class="num">Outstanding</th></tr></thead><tbody>
-        ${linkedLoans.map(l => `<tr><td>${l.name}</td><td class="num">${fmtINR(loanActualBalance(l))}</td></tr>`).join('')}
+        ${linkedLoans.map(l => `<tr><td>${escapeHTML(l.name)}</td><td class="num">${fmtINR(loanActualBalance(l))}</td></tr>`).join('')}
       </tbody></table>
       <div class="jn" style="margin-top:6px;color:var(--red);">Total blocked by linked EMIs: ${fmtINR(linkedTotal)}</div>`;
   }
   return `<tr class="detail-row open"><td colspan="4">
     <div class="flex-between" style="margin-bottom:14px;">
       <div>
-        <div style="font-family:var(--font-display);font-size:15px;">${c.name}</div>
+        <div style="font-family:var(--font-display);font-size:15px;">${escapeHTML(c.name)}</div>
         ${c.issuerBank ? `<div class="jn" style="margin-top:2px;">Issuer: ${c.issuerBank}</div>` : ''}
         ${combinedLimitHTML}
       </div>
@@ -7115,7 +7255,7 @@ function openBulkMarkPaidModal(cardId) {
     </div>`).join('');
   openModal(`
     <h3>Bulk Mark Bills Paid</h3>
-    <div class="modal-sub">${card.name} — ${unpaid.length} unpaid bill${unpaid.length !== 1 ? 's' : ''}</div>
+    <div class="modal-sub">${escapeHTML(card.name)} — ${unpaid.length} unpaid bill${unpaid.length !== 1 ? 's' : ''}</div>
     <div style="margin-bottom:10px;">${billRows}</div>
     <div class="field helptext">Each selected bill will be marked paid at full amount today. Use Edit on individual bills to set a partial payment or different date.</div>
     <div class="modal-actions">
@@ -7180,7 +7320,7 @@ function quickGenerateNextBill(cardId) {
   const dueDate = addDays(billDate, offset);
   openModal(`
     <h3>Generate Next Bill</h3>
-    <div class="modal-sub">${card.name} — bill date ${fmtDate(billDate)}, due ${fmtDate(dueDate)}</div>
+    <div class="modal-sub">${escapeHTML(card.name)} — bill date ${fmtDate(billDate)}, due ${fmtDate(dueDate)}</div>
     <div class="field">
       <label>Bill Amount (₹)</label>
       <input type="number" id="f-gen-amount" step="any" placeholder="${lastBill.amount}" value="${lastBill.amount}" />
@@ -7233,7 +7373,7 @@ function openCreditCardQuickView(cardId) {
   const util = creditCardUtilization(c);
   const utilBand = util !== null ? creditUtilizationBand(util) : null;
   openDrawer(`
-    <div class="drawer-header"><h3>${c.name}</h3><button class="drawer-close" aria-label="Close">✕</button></div>
+    <div class="drawer-header"><h3>${escapeHTML(c.name)}</h3><button class="drawer-close" aria-label="Close">✕</button></div>
     <div class="drawer-sub">${c.issuerBank ? `Issued by ${c.issuerBank}` : 'Credit card'} · ${c.bills.length} bill${c.bills.length !== 1 ? 's' : ''} logged</div>
     <div class="drawer-section">
       <div class="drawer-stat-grid">
@@ -7304,8 +7444,8 @@ function renderLoans() {
         <div class="row-name">
           <span class="avatar-chip">${l.name.trim().split(/\s+/).slice(0,2).map(w=>w[0]).join('').toUpperCase()}</span>
           <div>
-            <div>${l.name}</div>
-            <div class="jn ${semanticClass(debtClassSemantic(cls))}" style="margin-top:2px;">${l.category} · ${debtClassLabel(cls)} Debt</div>
+            <div>${escapeHTML(l.name)}</div>
+            <div class="jn ${semanticClass(debtClassSemantic(cls))}" style="margin-top:2px;">${escapeHTML(l.category)} · ${debtClassLabel(cls)} Debt</div>
           </div>
         </div>
         <div class="btn-row" style="margin-top:7px;gap:5px;margin-left:40px;">
@@ -7344,7 +7484,7 @@ function loanDetailHTML(l) {
   return `<tr class="detail-row open"><td colspan="6">
     <div class="flex-between" style="margin-bottom:14px;">
       <div>
-        <div style="font-family:var(--font-display);font-size:15px;">${l.name}</div>
+        <div style="font-family:var(--font-display);font-size:15px;">${escapeHTML(l.name)}</div>
         <div class="jn">${l.rate}% p.a. · ${l.tenureMonths} months from ${fmtDate(l.startDate)} · total interest ${fmtINR(totalInterest)}</div>
         <div class="jn" style="margin-top:4px;color:var(--text-dim);">Actual balance splits each logged payment into interest (accrued daily at ${l.rate}% p.a.) and principal — only the principal portion reduces the balance below.</div>
       </div>
@@ -7356,7 +7496,7 @@ function loanDetailHTML(l) {
       </div>
     </div>
     ${l.purpose || l.securityAgainst ? `<div class="jn" style="margin-bottom:12px;">${l.purpose ? 'Purpose: ' + l.purpose : ''}${l.purpose && l.securityAgainst ? ' · ' : ''}${l.securityAgainst ? 'Security: ' + l.securityAgainst : ''}</div>` : ''}
-    ${l.linkedCardId ? (() => { const card = state.creditCards.find(c => c.id === l.linkedCardId); return card ? `<div class="jn" style="margin-bottom:12px;color:var(--red);">Linked to ${card.name} — this EMI's balance counts against that card's limit</div>` : ''; })() : ''}
+    ${l.linkedCardId ? (() => { const card = state.creditCards.find(c => c.id === l.linkedCardId); return card ? `<div class="jn" style="margin-bottom:12px;color:var(--red);">Linked to ${escapeHTML(card.name)} — this EMI's balance counts against that card's limit</div>` : ''; })() : ''}
     <div class="grid-2">
       <div>
         <div class="jn" style="margin-bottom:8px;text-transform:uppercase;letter-spacing:0.06em;">Amortization Schedule</div>
@@ -7380,9 +7520,12 @@ async function quickLogEMIPayment(loanId) {
   loan.payments = loan.payments || [];
   const paidAmount = Math.round(emi * 100) / 100;
   const paidDate = todayISO();
-  loan.payments.push({ id: uid(), date: paidDate, amount: paidAmount });
+  const payment = { id: uid(), date: paidDate, amount: paidAmount };
+  loan.payments.push(payment);
   logTransaction('add', 'Loan Payment', loan.name, `${fmtINR(emi)} on ${fmtDate(paidDate)}`);
-  mirrorAutoExpense('EMI/Loan Payment', loan.name, paidAmount, paidDate, null, `loan-${loanId}-${paidDate}-${uid()}`);
+  // linkedId keyed off this payment's own stable id (Phase 7 hardening — see
+  // openLoanPaymentFormModal for the matching edit/delete linkedId scheme).
+  mirrorAutoExpense('EMI/Loan Payment', loan.name, paidAmount, paidDate, null, `loan-${loanId}-${payment.id}`);
   await Storage.save(state);
   showToast('EMI payment logged — ' + fmtINR(emi));
   openLiabIds.add(loanId);
@@ -7432,7 +7575,7 @@ function renderCashLoans() {
     const cls = cashLoanDebtClass(c);
     rows += `<tr class="data-row" id="cashloan-row-${c.id}">
       <td>
-        <div>${c.name}</div>
+        <div>${escapeHTML(c.name)}</div>
         <div class="jn ${semanticClass(debtClassSemantic(cls))}" style="margin-top:2px;">${debtClassLabel(cls)} Debt</div>
         <div class="btn-row" style="margin-top:5px;gap:5px;">
           <button class="btn btn-ghost btn-sm" data-quick-log-repay="${c.id}" style="padding:2px 7px;font-size:10.5px;">+ Log Repayment</button>
@@ -7459,7 +7602,7 @@ function cashLoanDetailHTML(c) {
   return `<tr class="detail-row open"><td colspan="4">
     <div class="flex-between" style="margin-bottom:14px;">
       <div>
-        <div style="font-family:var(--font-display);font-size:15px;">${c.name}</div>
+        <div style="font-family:var(--font-display);font-size:15px;">${escapeHTML(c.name)}</div>
         <div class="jn">Borrowed ${fmtDate(c.startDate)}${c.rate ? ' · ' + c.rate + '% p.a. simple interest' : ' · interest-free'}</div>
       </div>
       <div class="btn-row">
@@ -7500,7 +7643,7 @@ function openCardFormModal(existingCard) {
         <label>Start from Template <span class="hint" style="text-transform:none;">optional</span></label>
         <select id="f-card-template">
           <option value="">— Blank card —</option>
-          ${cardTemplates.map(t => `<option value="${t.id}">${t.name}</option>`).join('')}
+          ${cardTemplates.map(t => `<option value="${t.id}">${escapeHTML(t.name)}</option>`).join('')}
         </select>
       </div>
       <div class="field">
@@ -7627,8 +7770,14 @@ function openCardFormModal(existingCard) {
       const sampleBillDate = billDateInput.value || null;
       const sampleDueDate = dueDateInput.value || null;
       const isUPI = modal.querySelector('#f-is-upi').checked;
-      const creditLimit = parseFloat(modal.querySelector('#f-credit-limit').value) || null;
-      const combinedBankLimit = parseFloat(modal.querySelector('#f-combined-limit').value) || null;
+      // creditLimit/combinedBankLimit are optional -- `|| null` correctly treats blank/zero/NaN
+      // as "not set", but a plain `|| null` lets a NEGATIVE number through (negative numbers are
+      // truthy), which would later divide utilization % by a negative limit. Explicitly reject
+      // negatives back to null too (Phase 6 hardening).
+      const creditLimitRaw = parseFloat(modal.querySelector('#f-credit-limit').value);
+      const creditLimit = (Number.isFinite(creditLimitRaw) && creditLimitRaw > 0) ? creditLimitRaw : null;
+      const combinedLimitRaw = parseFloat(modal.querySelector('#f-combined-limit').value);
+      const combinedBankLimit = (Number.isFinite(combinedLimitRaw) && combinedLimitRaw > 0) ? combinedLimitRaw : null;
       const selVal = modal.querySelector('#f-issuer-bank').value;
       let issuerBank = '';
       if (selVal === '__other__') {
@@ -7665,7 +7814,7 @@ function openBillFormModal(cardId, existingBill) {
   const suggestedDueDate = isEdit ? existingBill.dueDate : addDays(suggestedBillDate, offset);
   openModal(`
     <h3>${isEdit ? 'Edit Bill' : 'Log Bill'}</h3>
-    <div class="modal-sub">${card.name}${!isEdit && lastBill ? ' — pre-filled one month after your last bill' : ''}</div>
+    <div class="modal-sub">${escapeHTML(card.name)}${!isEdit && lastBill ? ' — pre-filled one month after your last bill' : ''}</div>
     <div class="field-row">
       <div class="field"><label>Bill / Statement Date</label><input type="date" id="f-bill-date" value="${suggestedBillDate}" /></div>
       <div class="field"><label>Due Date</label><input type="date" id="f-due-date" value="${suggestedDueDate}" /></div>
@@ -7692,12 +7841,22 @@ function openBillFormModal(cardId, existingBill) {
         existingBill.amount = amount;
         existingBill.paid = modal.querySelector('#f-paid').checked;
         existingBill.paidAmount = parseFloat(modal.querySelector('#f-paid-amount').value) || 0;
+        // Keep the mirrored Cash Flow entry in sync with the Paid checkbox/amount here too —
+        // not just the quickMarkBillPaid button path — so editing a bill's paid state or
+        // amount never leaves a stale or out-of-date automatic expense (Phase 7 hardening).
+        if (existingBill.paid) {
+          if (!existingBill.paidDate) existingBill.paidDate = todayISO();
+          mirrorAutoExpense('Credit Card Bill', card.name, existingBill.paidAmount || existingBill.amount, existingBill.paidDate, null, `cardbill-${existingBill.id}`);
+        } else {
+          unmirrorAutoExpense(`cardbill-${existingBill.id}`);
+        }
         logTransaction('edit', 'Credit Card Bill', card.name, `${fmtINR(amount)} due ${fmtDate(existingBill.dueDate)}`);
         await Storage.save(state);
         closeModal();
         showToast('Bill updated');
         openLiabIds.add(cardId);
         renderLiabilities();
+        renderDashboard();
         return;
       }
       const baseBillDate = billDateEl.value || todayISO();
@@ -7725,16 +7884,23 @@ function openEditBillModal(cardId, billId) {
 async function deleteCard(cardId) {
   if (!confirm('Delete this card and all its bill history?')) return;
   const card = state.creditCards.find(c => c.id === cardId);
+  // Each bill on this card may have its own mirrored Cash Flow entry (`cardbill-<billId>`
+  // and/or `cardbill-<billId>-<linkId>` from Move Money partial payments) — clean up every
+  // one of them now that the parent card record is gone (Phase 7 hardening).
+  if (card) (card.bills || []).forEach(b => unmirrorAutoExpensesByPrefix(`cardbill-${b.id}`));
   state.creditCards = state.creditCards.filter(c => c.id !== cardId);
   if (card) logAudit('delete', 'Credit Card', card.name);
-  await Storage.save(state); showToast('Card deleted'); renderLiabilities();
+  await Storage.save(state); showToast('Card deleted'); renderLiabilities(); renderDashboard();
 }
 async function deleteBill(cardId, billId) {
   const card = state.creditCards.find(c => c.id === cardId);
   const bill = card.bills.find(b => b.id === billId);
   card.bills = card.bills.filter(b => b.id !== billId);
+  // Remove any mirrored Cash Flow entry for this bill — its source record no longer exists
+  // (Phase 7 hardening).
+  unmirrorAutoExpense(`cardbill-${billId}`);
   if (bill) logTransaction('delete', 'Credit Card Bill', card.name, `${fmtINR(bill.amount)} due ${fmtDate(bill.dueDate)}`);
-  await Storage.save(state); showToast('Bill deleted'); renderLiabilities();
+  await Storage.save(state); showToast('Bill deleted'); renderLiabilities(); renderDashboard();
 }
 
 /* ---- Loans & EMIs ---- */
@@ -7751,7 +7917,7 @@ function openLoanFormModal(existingLoan) {
         <label>Start from Template <span class="hint" style="text-transform:none;">optional</span></label>
         <select id="f-liab-template">
           <option value="">— Blank loan —</option>
-          ${liabTemplates.map(t => `<option value="${t.id}">${t.name}</option>`).join('')}
+          ${liabTemplates.map(t => `<option value="${t.id}">${escapeHTML(t.name)}</option>`).join('')}
         </select>
       </div>
       <div class="field">
@@ -7910,7 +8076,14 @@ function openLoanFormModal(existingLoan) {
       const principal = parseFloat(principalInput.value);
       const rate = parseFloat(rateInput.value) || 0;
       const tenure = parseInt(tenureInput.value);
-      if (!name || !principal || !tenure) { showToast('Fill in name, principal, and tenure — check the Loan Wizard could solve for a valid value'); return; }
+      // Explicit finite/positive checks -- `!principal`/`!tenure` alone are truthiness checks
+      // that let negative numbers through silently (negative numbers are truthy in JS), and
+      // also reject a legitimately-zero rate is fine since rate has its own `|| 0` default
+      // (Phase 6 hardening).
+      if (!name || !Number.isFinite(principal) || principal <= 0 || !Number.isFinite(tenure) || tenure <= 0 || rate < 0) {
+        showToast('Enter a name, a positive principal, and a positive tenure (rate can\'t be negative) — or use the Loan Wizard to solve for a valid value');
+        return;
+      }
       const purpose = optionalMasterFieldValue(modal, 'f-purpose');
       ensureInMasterList('purposes', purpose);
       const fields = {
@@ -7948,7 +8121,7 @@ function openLoanPaymentFormModal(loanId, existingPayment) {
   const suggestedAmount = isEdit ? existingPayment.amount : (emi ? emi.toFixed(2) : '');
   openModal(`
     <h3>${isEdit ? 'Edit Payment' : 'Log Payment'}</h3>
-    <div class="modal-sub">${loan.name} — EMI ${fmtINR(emi)}</div>
+    <div class="modal-sub">${escapeHTML(loan.name)} — EMI ${fmtINR(emi)}</div>
     <div class="field-row">
       <div class="field"><label>Date</label><input type="date" id="f-date" value="${suggestedDate}" /></div>
       <div class="field"><label>Amount (₹)</label><input type="number" id="f-amount" step="any" value="${suggestedAmount}" /></div>
@@ -7967,17 +8140,33 @@ function openLoanPaymentFormModal(loanId, existingPayment) {
       const baseDate = modal.querySelector('#f-date').value || todayISO();
       if (isEdit) {
         Object.assign(existingPayment, { date: baseDate, amount });
+        // Keep the mirrored Cash Flow entry in sync — linkedId is keyed off this payment's
+        // own stable id so edits update it in place instead of leaving it stale
+        // (Phase 7 hardening).
+        // A payment made via Move Money carries its own `linkId` (set at creation, see
+        // applyMoneyMovement's loan branch) distinct from its `id` -- fall back to `id` for
+        // ordinary manually-logged payments so the mirror key always matches whichever key
+        // this exact payment was originally mirrored under (Phase 7 hardening).
+        mirrorAutoExpense('EMI/Loan Payment', loan.name, amount, baseDate, null, `loan-${loanId}-${existingPayment.linkId || existingPayment.id}`);
         logTransaction('edit', 'Loan Payment', loan.name, `${fmtINR(amount)} on ${fmtDate(baseDate)}`);
         await Storage.save(state);
         closeModal();
         showToast('Payment updated');
         openLiabIds.add(loanId);
         renderLiabilities();
+        renderDashboard();
         return;
       }
       const dates = getRepeatOccurrences(modal, baseDate);
       loan.payments = loan.payments || [];
-      dates.forEach(date => { loan.payments.push({ id: uid(), date, amount }); mirrorAutoExpense('EMI/Loan Payment', loan.name, amount, date, null, `loan-${loanId}-${date}-${uid()}`); });
+      dates.forEach(date => {
+        const payment = { id: uid(), date, amount };
+        loan.payments.push(payment);
+        // linkedId keyed off this payment's own stable id, not a second uid() thrown away
+        // after use — that made the "one auto expense per linkedId" dedup a no-op since the
+        // key was different on every call (Phase 7 hardening).
+        mirrorAutoExpense('EMI/Loan Payment', loan.name, amount, date, null, `loan-${loanId}-${payment.id}`);
+      });
       logTransaction('add', 'Loan Payment', loan.name, `${fmtINR(amount)}${dates.length > 1 ? ` × ${dates.length}` : ' on ' + fmtDate(baseDate)}`);
       await Storage.save(state);
       closeModal();
@@ -8006,7 +8195,7 @@ function openPrepaymentCalculatorModal(loanId) {
   const currentEMI = emiAmount(loan.principal, loan.rate, loan.tenureMonths, loan.interestType);
   openModal(`
     <h3>Prepayment Calculator</h3>
-    <div class="modal-sub">${loan.name} — current balance ${fmtINR(currentBalance)}, EMI ${fmtINR(currentEMI)}</div>
+    <div class="modal-sub">${escapeHTML(loan.name)} — current balance ${fmtINR(currentBalance)}, EMI ${fmtINR(currentEMI)}</div>
     <div class="field-row">
       <div class="field"><label>Lump-Sum Prepayment (₹)</label><input type="number" id="f-lumpsum" step="any" placeholder="0.00" /></div>
       <div class="field"><label>New EMI (₹) <span class="hint" style="text-transform:none;">optional</span></label><input type="number" id="f-new-emi" step="any" placeholder="leave blank to keep ${fmtINR(currentEMI, { decimals: 0 })}" /></div>
@@ -8089,16 +8278,22 @@ function openPrepaymentCalculatorModal(loanId) {
 async function deleteLoan(loanId) {
   if (!confirm('Delete this loan and its full payment history?')) return;
   const loan = state.loans.find(l => l.id === loanId);
+  // Every payment against this loan was mirrored as `loan-<id>-...` — remove all of them by
+  // prefix now that the parent record itself is gone (Phase 7 hardening).
+  unmirrorAutoExpensesByPrefix(`loan-${loanId}-`);
   state.loans = state.loans.filter(l => l.id !== loanId);
   if (loan) logAudit('delete', 'Loan', loan.name);
-  await Storage.save(state); showToast('Loan deleted'); renderLiabilities();
+  await Storage.save(state); showToast('Loan deleted'); renderLiabilities(); renderDashboard();
 }
 async function deleteLoanPayment(loanId, paymentId) {
   const loan = state.loans.find(l => l.id === loanId);
   const payment = loan.payments.find(p => p.id === paymentId);
   loan.payments = loan.payments.filter(p => p.id !== paymentId);
+  // Remove the mirrored Cash Flow entry — its source payment no longer exists
+  // (Phase 7 hardening).
+  unmirrorAutoExpense(`loan-${loanId}-${(payment && payment.linkId) || paymentId}`);
   if (payment) logTransaction('delete', 'Loan Payment', loan.name, `${fmtINR(payment.amount)} on ${fmtDate(payment.date)}`);
-  await Storage.save(state); showToast('Payment deleted'); renderLiabilities();
+  await Storage.save(state); showToast('Payment deleted'); renderLiabilities(); renderDashboard();
 }
 
 /* ---- Cash Loans Taken ---- */
@@ -8139,11 +8334,17 @@ function openCashLoanFormModal(existingCashLoan) {
     modal.querySelector('#f-save').onclick = async () => {
       const name = modal.querySelector('#f-name').value.trim();
       const principal = parseFloat(modal.querySelector('#f-principal').value);
-      if (!name || !principal) { showToast('Fill in the lender and principal'); return; }
+      const rate = parseFloat(modal.querySelector('#f-rate').value) || 0;
+      // See loan modal's identical fix above -- explicit finite/positive checks instead of
+      // a truthiness check that silently let negative principal through (Phase 6 hardening).
+      if (!name || !Number.isFinite(principal) || principal <= 0 || rate < 0) {
+        showToast('Enter a lender name and a positive principal (rate can\'t be negative)');
+        return;
+      }
       const purpose = optionalMasterFieldValue(modal, 'f-purpose');
       ensureInMasterList('purposes', purpose);
       const fields = {
-        name, principal, rate: parseFloat(modal.querySelector('#f-rate').value) || 0, startDate: modal.querySelector('#f-start').value,
+        name, principal, rate, startDate: modal.querySelector('#f-start').value,
         purpose, securityAgainst: modal.querySelector('#f-security').value.trim() || null,
         debtClass: modal.querySelector('#f-debt-class').value || null
       };
@@ -8188,23 +8389,32 @@ function openCashRepaymentFormModal(cashLoanId, existingRepayment) {
       const cl = state.cashLoans.find(c => c.id === cashLoanId);
       if (isEdit) {
         Object.assign(existingRepayment, { date: baseDate, amount });
+        // Mirror into Cash Flow the same way loan payments do — see openLoanPaymentFormModal
+        // for the linkId||id fallback rationale (Phase 8 hardening).
+        mirrorAutoExpense('EMI/Loan Payment', cl.name, amount, baseDate, null, `cashloan-${cashLoanId}-${existingRepayment.linkId || existingRepayment.id}`);
         logTransaction('edit', 'Cash Loan Repayment', cl.name, `${fmtINR(amount)} on ${fmtDate(baseDate)}`);
         await Storage.save(state);
         closeModal();
         showToast('Repayment updated');
         openLiabIds.add(cashLoanId);
         renderLiabilities();
+        renderDashboard();
         return;
       }
       const dates = getRepeatOccurrences(modal, baseDate);
       cl.repayments = cl.repayments || [];
-      dates.forEach(date => cl.repayments.push({ id: uid(), date, amount }));
+      dates.forEach(date => {
+        const repayment = { id: uid(), date, amount };
+        cl.repayments.push(repayment);
+        mirrorAutoExpense('EMI/Loan Payment', cl.name, amount, date, null, `cashloan-${cashLoanId}-${repayment.id}`);
+      });
       logTransaction('add', 'Cash Loan Repayment', cl.name, `${fmtINR(amount)}${dates.length > 1 ? ` × ${dates.length}` : ' on ' + fmtDate(baseDate)}`);
       await Storage.save(state);
       closeModal();
       showToast(dates.length > 1 ? `${dates.length} repayments logged` : 'Repayment logged');
       openLiabIds.add(cashLoanId);
       renderLiabilities();
+      renderDashboard();
     };
   });
 }
@@ -8218,16 +8428,20 @@ function openEditCashRepaymentModal(cashLoanId, repayId) {
 async function deleteCashLoan(id) {
   if (!confirm('Delete this cash loan and its repayment history?')) return;
   const cl = state.cashLoans.find(c => c.id === id);
+  // Every repayment against this cash loan was mirrored as `cashloan-<id>-...` — remove all
+  // of them by prefix now that the parent record itself is gone (Phase 8 hardening).
+  unmirrorAutoExpensesByPrefix(`cashloan-${id}-`);
   state.cashLoans = state.cashLoans.filter(c => c.id !== id);
   if (cl) logAudit('delete', 'Cash Loan', cl.name);
-  await Storage.save(state); showToast('Deleted'); renderLiabilities();
+  await Storage.save(state); showToast('Deleted'); renderLiabilities(); renderDashboard();
 }
 async function deleteCashRepayment(cashLoanId, repayId) {
   const cl = state.cashLoans.find(c => c.id === cashLoanId);
   const repay = cl.repayments.find(r => r.id === repayId);
   cl.repayments = cl.repayments.filter(r => r.id !== repayId);
+  unmirrorAutoExpense(`cashloan-${cashLoanId}-${(repay && repay.linkId) || repayId}`);
   if (repay) logTransaction('delete', 'Cash Loan Repayment', cl.name, `${fmtINR(repay.amount)} on ${fmtDate(repay.date)}`);
-  await Storage.save(state); showToast('Repayment deleted'); renderLiabilities();
+  await Storage.save(state); showToast('Repayment deleted'); renderLiabilities(); renderDashboard();
 }
 
 /* ===================== CASH FLOW (Income & Expenses) =====================
@@ -8245,15 +8459,35 @@ async function deleteCashRepayment(cashLoanId, repayId) {
    ========================================================================= */
 let cfIncomeFilter = 'All', cfExpenseFilter = 'All', cfIncomeSearch = '', cfExpenseSearch = '';
 
+/* Upsert semantics: creates the auto-expense for this linkedId if none exists yet, or
+   updates the existing one in place if it does. Previously this only ever created-once
+   and silently no-opped on a repeat call, so editing a payment's amount/date never
+   propagated to its mirrored Cash Flow entry (Phase 7 hardening) -- see also
+   unmirrorAutoExpense()/unmirrorAutoExpensesByPrefix() for the delete/unpay side. */
 function mirrorAutoExpense(category, note, amount, date, account, linkedId) {
-  if (!amount || amount <= 0) return;
-  // Avoid double-mirroring the same paid obligation if this function is ever called twice
-  // for the same linkedId (e.g. a modal re-save) — one auto expense per linkedId.
-  if (linkedId && state.expenses.some(e => e.linkedId === linkedId && e.source === 'auto')) return;
+  if (!amount || amount <= 0) { if (linkedId) unmirrorAutoExpense(linkedId); return; }
+  const existing = linkedId ? state.expenses.find(e => e.linkedId === linkedId && e.source === 'auto') : null;
+  if (existing) {
+    Object.assign(existing, { date: date || todayISO(), category, amount, account: account || '—', note });
+    return;
+  }
   state.expenses.push({
     id: uid(), date: date || todayISO(), category, amount, account: account || '—',
     note, recurring: null, source: 'auto', linkedId: linkedId || null
   });
+}
+// Removes the single automatic Cash Flow entry linked to a deleted/unpaid source payment
+// event. Manually created entries (source !== 'auto') are never touched.
+function unmirrorAutoExpense(linkedId) {
+  if (!linkedId) return;
+  state.expenses = state.expenses.filter(e => !(e.linkedId === linkedId && e.source === 'auto'));
+}
+// Removes ALL automatic Cash Flow entries whose linkedId starts with the given prefix --
+// used when a whole parent record (e.g. a recurring Bill with many paid instances in its
+// history) is deleted outright, not just one payment event.
+function unmirrorAutoExpensesByPrefix(prefix) {
+  if (!prefix) return;
+  state.expenses = state.expenses.filter(e => !(e.source === 'auto' && e.linkedId && e.linkedId.startsWith(prefix)));
 }
 
 function cfMonthRange(monthsBack) {
@@ -8390,7 +8624,7 @@ function renderCfOverview() {
       <div class="card">
         ${expBreak.length ? expBreak.map(r => `
           <div class="breakdown-row">
-            <div class="bd-label"><span class="bd-dot" style="background:${r.color};"></span>${r.category}</div>
+            <div class="bd-label"><span class="bd-dot" style="background:${r.color};"></span>${escapeHTML(r.category)}</div>
             <div class="bd-bar-track"><div class="bd-bar" style="width:${Math.max(2, r.pct)}%;background:${r.color};"></div></div>
             <div class="bd-amt">${fmtINR(r.amount)}</div>
           </div>`).join('') : `<div class="empty-state">No expenses logged this month yet.</div>`}
@@ -8603,7 +8837,7 @@ function renderReportsPerformance() {
     const gpSem = gp !== null ? returnSemantic(gp, null) : 'neutral';
     const potentialTax = assetPotentialTax(a);
     return `<tr>
-      <td>${a.name}<div class="jn">${a.category}</div></td>
+      <td>${escapeHTML(a.name)}<div class="jn">${a.category}</div></td>
       <td class="num">${fmtINR(assetInvested(a))}</td>
       <td class="num">${fmtINR(assetCurrentValue(a))}</td>
       <td class="num ${gp !== null ? semanticClass(gpSem) : ''}">${gp !== null ? fmtPct(gp) : '—'}</td>
@@ -8700,7 +8934,7 @@ async function deleteSnapshot(id) {
 function executiveSummaryAssetRowHTML(item, expanded) {
   const tA = totalAssets();
   const rows = `<tr class="data-row" data-report-row="asset-${item.id}">
-    <td>${item.name}<div class="jn">${item.category}</div></td>
+    <td>${escapeHTML(item.name)}<div class="jn">${item.category}</div></td>
     <td class="num">${fmtINR(item.value)}</td>
     <td class="num">${tA > 0 ? ((item.value / tA) * 100).toFixed(1) : '0.0'}%</td>
   </tr>`;
@@ -8719,7 +8953,7 @@ function executiveSummaryAssetRowHTML(item, expanded) {
 }
 function executiveSummaryLiabilityRowHTML(item, expanded) {
   const rows = `<tr class="data-row" data-report-row="liab-${item.kind}-${item.id}">
-    <td>${item.name}<div class="jn">${item.category}</div></td>
+    <td>${escapeHTML(item.name)}<div class="jn">${item.category}</div></td>
     <td class="num">${fmtINR(item.value)}</td>
   </tr>`;
   if (!expanded) return rows;
@@ -8901,7 +9135,7 @@ function renderReportsAttribution() {
       const drill = document.getElementById('attr-pack-drill');
       if (!drill || !a) return;
       drill.innerHTML = `<div class="card" style="padding:12px 16px;display:flex;gap:20px;flex-wrap:wrap;align-items:center;">
-        <div><div style="font-family:var(--font-display);font-size:14px;color:var(--gold);">${a.name}</div><div style="font-size:11px;color:var(--text-dim);">${a.category}</div></div>
+        <div><div style="font-family:var(--font-display);font-size:14px;color:var(--gold);">${escapeHTML(a.name)}</div><div style="font-size:11px;color:var(--text-dim);">${a.category}</div></div>
         ${[['Value',fmtINR(assetCurrentValue(a))],['Invested',fmtINR(assetInvested(a))],['Portfolio Wt.',(assetCurrentValue(a)/tA*100).toFixed(1)+'%'],['XIRR',assetXIRR(a)!==null?fmtPct(assetXIRR(a)):'—']].map(([l,v])=>`<div style="text-align:right;"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;">${l}</div><div style="font-family:var(--font-mono);font-size:12px;color:var(--text);">${v}</div></div>`).join('')}
         <button onclick="this.closest('div.card').remove()" aria-label="Close" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:15px;margin-left:auto;">✕</button>
       </div>`;
@@ -8914,7 +9148,7 @@ function renderReportsIncomeCashflow() {
   const wrap = document.getElementById('reports-content');
   const incomeRows = state.assets.filter(a => expectedMonthlyIncome(a) > 0).map(a => {
     const m = expectedMonthlyIncome(a);
-    return `<tr><td>${a.name}<div class="jn">${a.category}</div></td><td style="text-transform:capitalize;">${a.expectedIncome.type}</td><td class="num">${fmtINR(m)}</td><td class="num">${fmtINR(m * 12)}</td></tr>`;
+    return `<tr><td>${escapeHTML(a.name)}<div class="jn">${a.category}</div></td><td style="text-transform:capitalize;">${a.expectedIncome.type}</td><td class="num">${fmtINR(m)}</td><td class="num">${fmtINR(m * 12)}</td></tr>`;
   }).join('');
   const totalMonthly = totalExpectedMonthlyIncome();
 
@@ -9033,7 +9267,7 @@ function renderReportsGoals() {
     const sem = dev < 3 ? 'neutral' : dev < 8 ? 'caution' : 'adverse';
     const x = purposeXIRR(r.purpose);
     return `<tr>
-      <td>${r.purpose}</td>
+      <td>${escapeHTML(r.purpose)}</td>
       <td class="num">${r.targetPct ? r.targetPct.toFixed(1) + '%' : '—'}</td>
       <td class="num">${r.actualPct.toFixed(1)}%</td>
       <td class="num ${semanticClass(sem)}">${fmtPct(r.deviationPct)}</td>
@@ -9107,9 +9341,13 @@ function renderReportsTax() {
     const txs = (a.transactions || []).filter(t => t.date >= fyStart && t.date <= fyEnd && (t.type === 'sell' || t.type === 'redeem' || t.type === 'redemption'));
     txs.forEach(tx => {
       const buyTxs = (a.transactions || []).filter(t => t.date < tx.date && (t.type === 'buy' || t.type === 'invest' || t.type === 'purchase'));
-      const avgBuy = buyTxs.length ? buyTxs.reduce((s, t) => s + (t.price || t.nav || 0) * (t.units || t.quantity || 1), 0) / buyTxs.reduce((s, t) => s + (t.units || t.quantity || 1), 0) : 0;
-      const sellPrice = tx.price || tx.nav || 0;
-      const units = tx.units || tx.quantity || 1;
+      // Transaction schema is qty/price/amount (see assetQty()/assetInvested()) — 'units',
+      // 'quantity', and 'nav' are not real fields on this model, so falling through to
+      // them always landed on the final "|| 1" default, silently treating every sale as
+      // exactly 1 unit sold regardless of its actual qty. Read qty/price directly.
+      const avgBuy = buyTxs.length ? buyTxs.reduce((s, t) => s + (t.price || 0) * (t.qty || 0), 0) / (buyTxs.reduce((s, t) => s + (t.qty || 0), 0) || 1) : 0;
+      const sellPrice = tx.price || 0;
+      const units = tx.qty || 0;
       const proceeds = sellPrice * units;
       const costBasis = avgBuy * units;
       const gain = proceeds - costBasis;
@@ -9156,9 +9394,15 @@ function renderReportsTax() {
   });
 
   // --- Dividend / Expected Income ---
-  const divRows = state.assets.filter(a => a.expectedIncome && a.expectedIncome.annualAmount > 0).map(a => {
+  // The Asset model's expectedIncome schema (see expectedMonthlyIncome()) is
+  // { amount, type, frequency } — there is no `annualAmount` field, so this
+  // filter/map was always empty (annualAmount is always undefined → the
+  // `> 0` check always fails). Annualize amount/frequency the same way
+  // expectedMonthlyIncome() does, just ×12 instead of ÷12.
+  const divRows = state.assets.filter(a => a.expectedIncome && a.expectedIncome.amount > 0 && a.expectedIncome.type && a.expectedIncome.type !== 'None').map(a => {
     const inc = a.expectedIncome;
-    const annualAmt = inc.annualAmount || 0;
+    const perYear = { monthly: 12, quarterly: 4, yearly: 1 }[inc.frequency] || 12;
+    const annualAmt = (inc.amount || 0) * perYear;
     const type = inc.type || 'Income';
     // Prorate if asset was bought mid-FY
     return { name: a.name, category: a.category, type, annualAmount: annualAmt };
@@ -9201,7 +9445,7 @@ function renderReportsTax() {
           </tr></thead>
           <tbody>
             ${cgRows.map(r => `<tr>
-              <td>${r.asset}<div class="jn">${r.category}</div></td>
+              <td>${escapeHTML(r.asset)}<div class="jn">${escapeHTML(r.category)}</div></td>
               <td>${fmtDate(r.txDate)}</td>
               <td class="num">${fmtINR(r.proceeds)}</td>
               <td class="num">${fmtINR(r.costBasis)}</td>
@@ -9223,7 +9467,7 @@ function renderReportsTax() {
         <table class="ledger">
           <thead><tr><th>Loan</th><th>Category</th><th class="num">Interest Component</th><th class="hint" style="padding:10px 16px;">Taxed at slab rate</th></tr></thead>
           <tbody>
-            ${intRows.map(r => `<tr><td>${r.name}</td><td>${r.category}</td><td class="num">${fmtINR(r.interest)}</td><td class="jn">As per slab</td></tr>`).join('')}
+            ${intRows.map(r => `<tr><td>${escapeHTML(r.name)}</td><td>${r.category}</td><td class="num">${fmtINR(r.interest)}</td><td class="jn">As per slab</td></tr>`).join('')}
             <tr class="subtotal"><td colspan="2">Total Interest Paid</td><td class="num">${fmtINR(totalInterest)}</td><td></td></tr>
           </tbody>
         </table>` : `<div class="empty-state">No loans or interest-bearing cash loans found. Add loans with principal, rate, and tenure — or a Cash Loan Taken with a rate set — to see interest breakdown.</div>`}
@@ -9237,7 +9481,7 @@ function renderReportsTax() {
         <table class="ledger">
           <thead><tr><th>Asset</th><th>Category</th><th>Income Type</th><th class="num">Annual Amount</th><th class="hint" style="padding:10px 16px;">Tax Treatment</th></tr></thead>
           <tbody>
-            ${divRows.map(r => `<tr><td>${r.name}</td><td>${r.category}</td><td>${r.type}</td><td class="num">${fmtINR(r.annualAmount)}</td><td class="jn">${r.type === 'Dividend' ? 'Taxed at slab (post FY2020)' : r.type.includes('Interest') ? 'Taxed at slab' : 'As applicable'}</td></tr>`).join('')}
+            ${divRows.map(r => `<tr><td>${escapeHTML(r.name)}</td><td>${r.category}</td><td>${r.type}</td><td class="num">${fmtINR(r.annualAmount)}</td><td class="jn">${r.type === 'Dividend' ? 'Taxed at slab (post FY2020)' : r.type.includes('Interest') ? 'Taxed at slab' : 'As applicable'}</td></tr>`).join('')}
           </tbody>
         </table>` : `<div class="empty-state">No Expected Income set on any asset. Edit an asset and set Expected Income (type + annual amount) to populate this section.</div>`}
       </div>
@@ -9320,14 +9564,14 @@ function renderReportsAnnual() {
     <section class="block">
       <div class="section-label">Largest Holdings</div>
       <div class="card" style="padding:0;overflow-x:auto;">
-        ${topAssets.length ? `<table class="ledger"><thead><tr><th>Asset</th><th class="num">Value</th></tr></thead><tbody>${topAssets.map(a => `<tr><td>${a.name}<div class="jn">${a.category}</div></td><td class="num">${fmtINR(a.value)}</td></tr>`).join('')}</tbody></table>` : `<div class="empty-state">No assets yet.</div>`}
+        ${topAssets.length ? `<table class="ledger"><thead><tr><th>Asset</th><th class="num">Value</th></tr></thead><tbody>${topAssets.map(a => `<tr><td>${escapeHTML(a.name)}<div class="jn">${a.category}</div></td><td class="num">${fmtINR(a.value)}</td></tr>`).join('')}</tbody></table>` : `<div class="empty-state">No assets yet.</div>`}
       </div>
     </section>
     ${goalRows.length ? `
     <section class="block">
       <div class="section-label">Goal Progress</div>
       <div class="card" style="padding:0;overflow-x:auto;">
-        <table class="ledger"><thead><tr><th>Purpose</th><th class="num">Target</th><th class="num">Actual</th></tr></thead><tbody>${goalRows.map(r => `<tr><td>${r.purpose}</td><td class="num">${r.targetPct ? r.targetPct.toFixed(1) + '%' : '—'}</td><td class="num">${r.actualPct.toFixed(1)}%</td></tr>`).join('')}</tbody></table>
+        <table class="ledger"><thead><tr><th>Purpose</th><th class="num">Target</th><th class="num">Actual</th></tr></thead><tbody>${goalRows.map(r => `<tr><td>${escapeHTML(r.purpose)}</td><td class="num">${r.targetPct ? r.targetPct.toFixed(1) + '%' : '—'}</td><td class="num">${r.actualPct.toFixed(1)}%</td></tr>`).join('')}</tbody></table>
       </div>
     </section>` : ''}
   `;
@@ -9427,11 +9671,11 @@ async function openAuditLog() {
    version so other charts (Executive Summary's donuts) can reuse it too (Module 12 / L3). */
 function openSegmentDrilldown(title, rows) {
   openModal(`
-    <h3>${title}</h3>
+    <h3>${escapeHTML(title)}</h3>
     <div class="card" style="padding:0;max-height:420px;overflow-y:auto;">
       ${rows.length
         ? rows.map(r => `<div class="flex-between" style="padding:10px 16px;border-bottom:1px solid var(--border-soft);">
-            <div><div style="font-size:13px;">${r.name}</div>${r.sub ? `<div class="jn" style="margin-top:2px;">${r.sub}</div>` : ''}</div>
+            <div><div style="font-size:13px;">${escapeHTML(r.name)}</div>${r.sub ? `<div class="jn" style="margin-top:2px;">${escapeHTML(r.sub)}</div>` : ''}</div>
             <div class="num">${fmtINR(r.value)}</div>
           </div>`).join('')
         : `<div class="empty-state">No items in this segment.</div>`}
@@ -9738,7 +9982,7 @@ function renderSettingsMasterData() {
       <div class="card">
         <div class="field helptext" style="margin-bottom:14px;">Paste rows as <code>currency,rate</code> — e.g. <code>USD,83.2</code> means 1 USD = 83.2 ${state.settings.baseCurrency}. New currency codes are added automatically.</div>
         <div class="btn-row" style="margin-bottom:14px;flex-wrap:wrap;">
-          ${state.settings.currencies.filter(c => c !== state.settings.baseCurrency).map(c => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${c} = ${state.settings.exchangeRates[c] ? fmtNum(state.settings.exchangeRates[c], 2) : '—'} ${state.settings.baseCurrency} <button data-del-currency="${escapeAttr(c)}" aria-label="Remove ${escapeAttr(c)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('') || `<span class="jn" style="color:var(--text-dim);">Only ${state.settings.baseCurrency} in use</span>`}
+          ${state.settings.currencies.filter(c => c !== state.settings.baseCurrency).map(c => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${escapeHTML(c)} = ${state.settings.exchangeRates[c] ? fmtNum(state.settings.exchangeRates[c], 2) : '—'} ${state.settings.baseCurrency} <button data-del-currency="${escapeAttr(c)}" aria-label="Remove ${escapeAttr(c)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('') || `<span class="jn" style="color:var(--text-dim);">Only ${state.settings.baseCurrency} in use</span>`}
         </div>
         <div class="field">
           <label>Add Entries</label>
@@ -9835,7 +10079,7 @@ EUR,90.5"></textarea>
       <div class="section-label">Asset Categories <span class="hint">add new types as they come up</span></div>
       <div class="card">
         <div class="btn-row" style="margin-bottom:14px;flex-wrap:wrap;">
-          ${state.categoriesAssets.map(c => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${c} <button data-del-acat="${c}" aria-label="Remove category ${escapeAttr(c)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('')}
+          ${state.categoriesAssets.map(c => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${escapeHTML(c)} <button data-del-acat="${escapeAttr(c)}" aria-label="Remove category ${escapeAttr(c)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('')}
         </div>
         <div class="btn-row">
           <input id="new-asset-cat" placeholder="e.g. Real Estate, ESOPs, Bonds" style="max-width:260px;background:var(--bg-alt);border:1px solid var(--border);color:var(--text);padding:8px 11px;border-radius:var(--radius-sm);font-size:13px;" />
@@ -9848,7 +10092,7 @@ EUR,90.5"></textarea>
       <div class="section-label">Liability Categories <span class="hint">controls chart/legend color ordering across Reports &amp; Dashboard</span></div>
       <div class="card">
         <div class="btn-row" style="margin-bottom:14px;flex-wrap:wrap;">
-          ${state.categoriesLiabilities.map(c => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${c} <button data-del-lcat="${c}" aria-label="Remove category ${escapeAttr(c)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('')}
+          ${state.categoriesLiabilities.map(c => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${escapeHTML(c)} <button data-del-lcat="${escapeAttr(c)}" aria-label="Remove category ${escapeAttr(c)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('')}
         </div>
         <div class="btn-row">
           <input id="new-liab-cat" placeholder="e.g. Overdraft" style="max-width:260px;background:var(--bg-alt);border:1px solid var(--border);color:var(--text);padding:8px 11px;border-radius:var(--radius-sm);font-size:13px;" />
@@ -9861,7 +10105,7 @@ EUR,90.5"></textarea>
       <div class="section-label">Loan / EMI Categories <span class="hint">drives the Category dropdown on Add/Edit Loan — mirrors how Asset Categories work</span></div>
       <div class="card">
         <div class="btn-row" style="margin-bottom:14px;flex-wrap:wrap;">
-          ${state.loanCategories.map(c => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${c} <button data-del-loancat="${escapeAttr(c)}" aria-label="Remove category ${escapeAttr(c)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('')}
+          ${state.loanCategories.map(c => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${escapeHTML(c)} <button data-del-loancat="${escapeAttr(c)}" aria-label="Remove category ${escapeAttr(c)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('')}
         </div>
         <div class="btn-row">
           <input id="new-loan-cat" placeholder="e.g. Education Loan, Gold Loan" style="max-width:260px;background:var(--bg-alt);border:1px solid var(--border);color:var(--text);padding:8px 11px;border-radius:var(--radius-sm);font-size:13px;" />
@@ -9875,7 +10119,7 @@ EUR,90.5"></textarea>
       <div class="section-label">Income Categories <span class="hint">drives the Category dropdown on Add Income, in Cash Flow</span></div>
       <div class="card">
         <div class="btn-row" style="margin-bottom:14px;flex-wrap:wrap;">
-          ${state.categoriesIncome.map(c => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${c} <button data-del-incomecat="${escapeAttr(c)}" aria-label="Remove category ${escapeAttr(c)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('')}
+          ${state.categoriesIncome.map(c => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${escapeHTML(c)} <button data-del-incomecat="${escapeAttr(c)}" aria-label="Remove category ${escapeAttr(c)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('')}
         </div>
         <div class="btn-row">
           <input id="new-income-cat" placeholder="e.g. Consulting, Dividend Payout" style="max-width:260px;background:var(--bg-alt);border:1px solid var(--border);color:var(--text);padding:8px 11px;border-radius:var(--radius-sm);font-size:13px;" />
@@ -9888,7 +10132,7 @@ EUR,90.5"></textarea>
       <div class="section-label">Expense Categories <span class="hint">drives the Category dropdown on Add Expense, in Cash Flow</span></div>
       <div class="card">
         <div class="btn-row" style="margin-bottom:14px;flex-wrap:wrap;">
-          ${state.categoriesExpenses.map(c => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${c} <button data-del-expensecat="${escapeAttr(c)}" aria-label="Remove category ${escapeAttr(c)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('')}
+          ${state.categoriesExpenses.map(c => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${escapeHTML(c)} <button data-del-expensecat="${escapeAttr(c)}" aria-label="Remove category ${escapeAttr(c)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('')}
         </div>
         <div class="btn-row">
           <input id="new-expense-cat" placeholder="e.g. Childcare, Pet Care" style="max-width:260px;background:var(--bg-alt);border:1px solid var(--border);color:var(--text);padding:8px 11px;border-radius:var(--radius-sm);font-size:13px;" />
@@ -9905,10 +10149,10 @@ EUR,90.5"></textarea>
           ? `<div style="padding:16px 18px;color:var(--text-dim);font-size:13px;">No classification groups yet. Create one to start tagging assets.</div>`
           : (state.assetClassifications || []).map(cl => {
               const tagged = (cl.assetIds || []).length;
-              const taggedNames = (cl.assetIds || []).map(aid => { const a = state.assets.find(x => x.id === aid); return a ? a.name : null; }).filter(Boolean);
+              const taggedNames = (cl.assetIds || []).map(aid => { const a = state.assets.find(x => x.id === aid); return a ? escapeHTML(a.name) : null; }).filter(Boolean);
               return `<div style="padding:12px 18px;border-bottom:1px solid var(--border-soft);display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">
                 <div>
-                  <div style="font-size:13.5px;font-weight:600;">${cl.name}</div>
+                  <div style="font-size:13.5px;font-weight:600;">${escapeHTML(cl.name)}</div>
                   <div class="jn" style="margin-top:3px;">
                     Type: <strong>${cl.assetType || '—'}</strong> &nbsp;·&nbsp;
                     Liquidity: <strong>${cl.liquidityLabel || '—'}</strong> &nbsp;·&nbsp;
@@ -9966,8 +10210,8 @@ function openClassificationModal(idOrNull) {
     const checked = existing && (existing.assetIds || []).includes(a.id) ? 'checked' : '';
     return `<label style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border-soft);cursor:pointer;">
       <input type="checkbox" data-asset-id="${a.id}" ${checked} />
-      <span style="font-size:13px;">${a.name}</span>
-      <span class="jn" style="margin-left:auto;">${a.category}</span>
+      <span style="font-size:13px;">${escapeHTML(a.name)}</span>
+      <span class="jn" style="margin-left:auto;">${escapeHTML(a.category)}</span>
     </label>`;
   }).join('');
 
@@ -10131,8 +10375,8 @@ function renderSettingsHealthCheck() {
     if (!group.length) return '';
     const rows = group.map(f => `
       <div class="hc-row" style="padding:12px 16px;border-bottom:1px solid var(--border-soft);border-left:3px solid ${semanticColorVar(f.sem)};" data-hc-target="${f.target ? escapeAttr(JSON.stringify(f.target)) : ''}">
-        <div style="font-size:13px;color:${semanticColorVar(f.sem)};font-weight:600;">${f.category} — ${f.label}</div>
-        <div class="jn" style="margin-top:2px;margin-left:0;color:var(--text-muted);font-family:var(--font-body);">${f.detail}</div>
+        <div style="font-size:13px;color:${semanticColorVar(f.sem)};font-weight:600;">${f.category} — ${escapeHTML(f.label)}</div>
+        <div class="jn" style="margin-top:2px;margin-left:0;color:var(--text-muted);font-family:var(--font-body);">${escapeHTML(f.detail)}</div>
       </div>`).join('');
     return `
       <div class="block">
@@ -10158,13 +10402,16 @@ function renderSettingsHealthCheck() {
 /* ---------- Audit Log subtab (spec 5.4) ---------- */
 let auditLogView = 'master'; // 'master' | 'transaction'
 function auditLogRowsHTML(entries) {
+  // entity/label/detail frequently carry asset/liability names built via template
+  // strings (e.g. logTransaction('add', 'Investment', `${fromAsset.name} → ${toAsset.name}`, ...))
+  // — escape as text content before rendering.
   return entries.map(e => `
     <tr>
       <td class="jn">${fmtDateTime(e.timestamp)}</td>
-      <td style="text-transform:capitalize;">${e.action}</td>
-      <td>${e.entity}</td>
-      <td>${e.label}</td>
-      <td class="jn">${e.detail || ''}</td>
+      <td style="text-transform:capitalize;">${escapeHTML(e.action)}</td>
+      <td>${escapeHTML(e.entity)}</td>
+      <td>${escapeHTML(e.label)}</td>
+      <td class="jn">${escapeHTML(e.detail || '')}</td>
     </tr>`).join('');
 }
 function renderSettingsAuditLog() {
@@ -10236,10 +10483,44 @@ async function saveMonthlyIncome(value) {
 }
 async function saveBaseCurrency(value) {
   const prev = state.settings.baseCurrency;
-  state.settings.baseCurrency = value;
-  if (value !== prev) logAudit('update', 'Settings', 'Base Currency', `${prev} → ${value}`);
-  await Storage.save(state);
-  showToast('Base currency updated');
+  if (value === prev) { renderSettings(); return; }
+  // exchangeRates is stored as "1 unit of X = rate units of the CURRENT base
+  // currency". Simply swapping baseCurrency without re-deriving the map would
+  // leave every existing rate meaningless (e.g. a USD rate quoted in INR terms
+  // suddenly read as if it were quoted in the new base) — exactly the
+  // "changing base currency can leave conversion relationships inconsistent"
+  // bug. Re-pivot every rate through the old base so the real-world FX
+  // relationships are preserved; asset/transaction amounts themselves are
+  // never touched, only the conversion table.
+  const pivotRate = state.settings.exchangeRates[value];
+  if (Number.isFinite(pivotRate) && pivotRate > 0) {
+    const rebased = {};
+    rebased[prev] = 1 / pivotRate; // old base now needs a rate into the new base
+    Object.keys(state.settings.exchangeRates).forEach((code) => {
+      if (code === value) return; // becomes the base — no self-rate needed
+      const oldRate = state.settings.exchangeRates[code];
+      if (Number.isFinite(oldRate) && oldRate > 0) rebased[code] = oldRate / pivotRate;
+      // Non-finite/invalid old rates are dropped rather than carried forward
+      // as corrupted numbers — Health Check will flag the resulting gap.
+    });
+    state.settings.exchangeRates = rebased;
+    if (!state.settings.currencies.includes(prev)) state.settings.currencies.push(prev);
+    state.settings.baseCurrency = value;
+    logAudit('update', 'Settings', 'Base Currency', `${prev} → ${value}`);
+    await Storage.save(state);
+    showToast('Base currency updated — exchange rates re-based automatically');
+  } else {
+    // No rate exists to pivot old ⇄ new base, so the old rate table can't be
+    // safely re-derived. Clear it rather than leave stale, wrongly-denominated
+    // rates in place — this surfaces as "Missing FX Rate" in Health Check
+    // instead of silently mis-converting existing assets.
+    state.settings.exchangeRates = {};
+    if (!state.settings.currencies.includes(prev)) state.settings.currencies.push(prev);
+    state.settings.baseCurrency = value;
+    logAudit('update', 'Settings', 'Base Currency', `${prev} → ${value}`);
+    await Storage.save(state);
+    showToast(`Base currency changed to ${value} — re-enter exchange rates, old rates couldn't convert automatically`);
+  }
   renderSettings();
 }
 
@@ -10366,7 +10647,7 @@ function masterDataSectionHTML(key) {
       <div class="section-label">${def.label}</div>
       <div class="card">
         <div class="btn-row" style="margin-bottom:14px;flex-wrap:wrap;">
-          ${items.length ? items.map(v => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${v} <button data-del-master="${key}" data-del-master-val="${escapeAttr(v)}" aria-label="Remove ${escapeAttr(v)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('') : `<span class="jn" style="color:var(--text-dim);">None yet</span>`}
+          ${items.length ? items.map(v => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;">${escapeHTML(v)} <button data-del-master="${key}" data-del-master-val="${escapeAttr(v)}" aria-label="Remove ${escapeAttr(v)}" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;">✕</button></span>`).join('') : `<span class="jn" style="color:var(--text-dim);">None yet</span>`}
         </div>
         <div class="btn-row">
           <input data-master-key="${key}" placeholder="${def.placeholder}" style="max-width:260px;background:var(--bg-alt);border:1px solid var(--border);color:var(--text);padding:8px 11px;border-radius:var(--radius-sm);font-size:13px;" />
@@ -10440,8 +10721,8 @@ function nomineeMasterSectionHTML() {
     <div style="display:flex;align-items:center;gap:10px;padding:9px 16px;border-bottom:1px solid var(--border-soft);">
       <input type="checkbox" class="nominee-select-cb" data-nominee-cb="${a.id}" ${selectedNomineeIds.has(a.id) ? 'checked' : ''} style="flex-shrink:0;" />
       <div style="flex:1;min-width:0;">
-        <div style="font-size:13px;">${a.name}</div>
-        <div class="jn" style="margin-top:2px;">${a.category}</div>
+        <div style="font-size:13px;">${escapeHTML(a.name)}</div>
+        <div class="jn" style="margin-top:2px;">${escapeHTML(a.category)}</div>
       </div>
       <div style="text-align:right;flex-shrink:0;">
         ${a.nominee
@@ -10677,6 +10958,12 @@ function findOrCreateCashLoan(name, defaults) {
   if (!c) { c = Object.assign({ id: uid(), name, principal: 0, rate: 0, startDate: todayISO(), repayments: [] }, defaults || {}); state.cashLoans.push(c); }
   return c;
 }
+// Returns `parsed` only if it's finite and > 0 (or >= 0 for the non-negative variant);
+// otherwise `fallback`. Guards CSV/bulk-import numeric fields against negative values
+// slipping through a bare `parseFloat(x) || fallback`, since negative numbers are truthy
+// in JS and that pattern alone doesn't reject them (Phase 6/10 hardening).
+function positiveOr(raw, fallback) { const v = parseFloat(raw); return (Number.isFinite(v) && v > 0) ? v : fallback; }
+function nonNegativeOr(raw, fallback) { const v = parseFloat(raw); return (Number.isFinite(v) && v >= 0) ? v : fallback; }
 function parseMasterCSV(raw) {
   const lines = raw.split('\n').map(l => l.replace(/\r$/, ''));
   let section = null, header = null;
@@ -10725,37 +11012,41 @@ function parseMasterCSV(raw) {
       }
       case 'LOANS': {
         if (!row.name) return;
-        const l = findOrCreateLoan(row.name, { category: row.category || 'Other', principal: parseFloat(row.principal) || 0, rate: parseFloat(row.rate) || 0, tenureMonths: parseInt(row.tenureMonths) || 0, startDate: row.startDate || todayISO() });
+        const l = findOrCreateLoan(row.name, { category: row.category || 'Other', principal: positiveOr(row.principal, 0), rate: nonNegativeOr(row.rate, 0), tenureMonths: Math.round(positiveOr(row.tenureMonths, 0)), startDate: row.startDate || todayISO() });
         l.category = row.category || l.category;
-        l.principal = parseFloat(row.principal) || l.principal;
-        l.rate = parseFloat(row.rate) || l.rate;
-        l.tenureMonths = parseInt(row.tenureMonths) || l.tenureMonths;
+        l.principal = positiveOr(row.principal, l.principal);
+        l.rate = nonNegativeOr(row.rate, l.rate);
+        l.tenureMonths = Math.round(positiveOr(row.tenureMonths, l.tenureMonths));
         l.startDate = row.startDate || l.startDate;
         counts.loans++;
         break;
       }
       case 'LOAN_PAYMENTS': {
-        if (!row.loanName || !row.date || !row.amount) return;
+        if (!row.loanName || !row.date) return;
+        const amount = positiveOr(row.amount, null);
+        if (amount === null) return; // reject missing/negative/non-finite payment amounts
         const l = findOrCreateLoan(row.loanName);
         l.payments = l.payments || [];
-        l.payments.push({ id: uid(), date: row.date, amount: parseFloat(row.amount) });
+        l.payments.push({ id: uid(), date: row.date, amount });
         counts.payments++;
         break;
       }
       case 'CASH_LOANS': {
         if (!row.name) return;
-        const c = findOrCreateCashLoan(row.name, { principal: parseFloat(row.principal) || 0, rate: parseFloat(row.rate) || 0, startDate: row.startDate || todayISO() });
-        c.principal = parseFloat(row.principal) || c.principal;
-        c.rate = parseFloat(row.rate) || c.rate;
+        const c = findOrCreateCashLoan(row.name, { principal: positiveOr(row.principal, 0), rate: nonNegativeOr(row.rate, 0), startDate: row.startDate || todayISO() });
+        c.principal = positiveOr(row.principal, c.principal);
+        c.rate = nonNegativeOr(row.rate, c.rate);
         c.startDate = row.startDate || c.startDate;
         counts.cashloans++;
         break;
       }
       case 'CASH_LOAN_REPAYMENTS': {
-        if (!row.cashLoanName || !row.date || !row.amount) return;
+        if (!row.cashLoanName || !row.date) return;
+        const amount = positiveOr(row.amount, null);
+        if (amount === null) return;
         const c = findOrCreateCashLoan(row.cashLoanName);
         c.repayments = c.repayments || [];
-        c.repayments.push({ id: uid(), date: row.date, amount: parseFloat(row.amount) });
+        c.repayments.push({ id: uid(), date: row.date, amount });
         counts.repayments++;
         break;
       }
