@@ -4295,6 +4295,49 @@ function closeModal() {
   document.removeEventListener('keydown', modalFocusTrapHandler);
   if (modalReturnFocusEl && document.body.contains(modalReturnFocusEl)) modalReturnFocusEl.focus();
   modalReturnFocusEl = null;
+  // Lets confirmModal() below resolve its promise on ANY dismissal path (Escape key,
+  // backdrop click), not just its own button clicks — same semantics as native confirm()
+  // returning false when the user dismisses it without choosing OK.
+  if (modalOnClose) { const cb = modalOnClose; modalOnClose = null; cb(); }
+}
+
+/* ---------- In-app confirm modal — replaces window.confirm() for restore flows ----------
+   Root cause of the Guardian GOLD-08 regression: native confirm()/alert()/prompt() dialogs
+   are auto-dismissed by default in CDP-driven automated browsers (this is documented,
+   explicit default behavior in Playwright, and the same class of behavior applies to any
+   headless/scripted Chromium session that doesn't register an explicit dialog handler —
+   see Playwright's own docs: "By default, dialogs are auto-dismissed by Playwright... If
+   there is no listener for Page.dialog, all dialogs are automatically dismissed.").
+   applyImport() and the encrypted-restore flow in openRestorePinModal() both used to gate
+   the actual restore on `if (!confirm(...)) return;` — under automated testing with no
+   dialog handler registered, that confirm() silently resolves to false, so the click on
+   "Import" appears to succeed (no error, no console warning — DSL steps look executable)
+   while mergeLoadedState()/Storage.save()/renderAll() never run and the app is silently
+   left showing whatever was there before. This is a UI-layer bug, not a storage/encryption/
+   race-condition bug — the storage layer, mergeLoadedState(), and load precedence were all
+   already correct once actually reached. This helper replaces the two restore-path confirm()
+   calls with the same in-app modal pattern already used for Erase All Data, so the outcome
+   no longer depends on how (or whether) a browser/automation context handles native dialogs.
+   Returns a Promise<boolean> — true only if the user (or a real click on the OK button)
+   explicitly confirms; any other dismissal (Cancel, Escape, backdrop click) resolves false,
+   matching native confirm()'s own semantics. */
+let modalOnClose = null;
+function confirmModal(title, message, confirmLabel) {
+  return new Promise((resolve) => {
+    let decided = false;
+    modalOnClose = () => { if (!decided) { decided = true; resolve(false); } };
+    openModal(`
+      <h3>${title}</h3>
+      <div class="modal-sub">${message}</div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="confirm-modal-cancel">Cancel</button>
+        <button class="btn btn-primary" id="confirm-modal-ok">${confirmLabel || 'Continue'}</button>
+      </div>
+    `, (modal) => {
+      modal.querySelector('#confirm-modal-cancel').onclick = () => { decided = true; closeModal(); resolve(false); };
+      modal.querySelector('#confirm-modal-ok').onclick = () => { decided = true; closeModal(); resolve(true); };
+    });
+  });
 }
 
 /* ===================== INLINE POPOVER HELPER (Module 6) =====================
@@ -11133,7 +11176,8 @@ async function applyImport(raw) {
     return;
   }
   if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.assets)) { showToast('This does not look like a Wealth Ledger backup'); return; }
-  if (!confirm('This will replace all current data. Continue?')) return;
+  const ok = await confirmModal('Restore Backup?', 'This will replace all current data. Continue?', 'Restore');
+  if (!ok) return;
   state = mergeLoadedState(parsed);
   logAudit('restore', 'Backup', 'Data restored from backup'); // logged onto the NEW state, after replacement, so it isn't lost by mergeLoadedState() adopting the backup's own auditLog
   await Storage.save(state);
@@ -11157,7 +11201,8 @@ function openRestorePinModal(backup) {
       let parsedState;
       try { parsedState = JSON.parse(result.json); } catch (e) { return { ok: false, error: 'Backup decrypted but its contents were corrupt.' }; }
       closeModal();
-      if (!confirm('This will replace all current data. Continue?')) return { ok: true };
+      const ok = await confirmModal('Restore Backup?', 'This will replace all current data. Continue?', 'Restore');
+      if (!ok) return { ok: true };
       state = mergeLoadedState(parsedState);
       logAudit('restore', 'Backup', 'Data restored from encrypted backup');
       await Storage.save(state);
